@@ -1,0 +1,14 @@
+node_modules/
+coverage/
+.env
+.env.local
+*.log
+logs/*
+!logs/.gitkeep
+uploads/*
+!uploads/.gitkeep
+storage-local/
+storage-test/
+test-results/
+.DS_Store
+*.tmp.mjs
