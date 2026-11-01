@@ -1,7 +1,11 @@
+.git
 node_modules
 storage-local
 storage-test
+test-results
+coverage
 uploads/tmp
 logs/*
 .env
 tests
+Dockerfile*

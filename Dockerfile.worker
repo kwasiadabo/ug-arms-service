@@ -1,0 +1,21 @@
+# Background worker: ingest, OCR, fixity, indexing, reports, imports, notifications and schedules.
+# Build from this folder: docker build -f Dockerfile.worker -t ug-arms-worker .
+# Includes Tesseract (English + configurable packs), Poppler for PDF rasterisation and FFmpeg/FFprobe.
+FROM node:24-trixie-slim
+ARG TESSERACT_LANGS="eng"
+RUN apt-get update \
+ && apt-get upgrade -y \
+ && apt-get install -y --no-install-recommends tesseract-ocr $(for l in $TESSERACT_LANGS; do echo tesseract-ocr-$l; done) poppler-utils ffmpeg ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+# The npm and corepack tools are removed after installing dependencies: the running service never needs them,
+# and they carry their own vulnerable dependencies (found by an image scan on 30 October 2026).
+RUN npm ci --omit=dev && npm cache clean --force \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+COPY src ./src
+COPY scripts ./scripts
+RUN mkdir -p uploads/tmp logs && chown -R node:node /app
+USER node
+CMD ["node", "src/jobs/worker.js"]
