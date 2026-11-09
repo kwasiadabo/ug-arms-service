@@ -94,6 +94,8 @@ const schema = z.object({
   TIKA_ENABLED: bool.default(false),
   TIKA_URL: z.string().default('http://localhost:9998'),
   OCR_ENABLED: bool.default(true),
+  // OCR jobs each worker process runs at once. Each job uses about one CPU core.
+  OCR_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(2),
   TESSERACT_PATH: z.string().default('tesseract'),
   FFPROBE_PATH: z.string().default('ffprobe'),
   OPENSEARCH_ENABLED: bool.default(false),

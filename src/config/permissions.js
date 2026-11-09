@@ -199,7 +199,7 @@ export const ROLES = {
   },
   digitisation_officer: {
     name: 'Digitisation Officer',
-    description: 'Manages digitisation batches, captures and uploads images, runs OCR and quality checks.',
+    description: 'Captures and uploads images for planned batches, runs OCR and quality checks.',
     permissions: [
       ...STAFF_BASE,
       'assets.upload',

@@ -1,10 +1,10 @@
 /**
  * Background worker entry point (`npm run worker`).
  *
- * Starts one BullMQ worker per queue with a concurrency suited to the work: OCR runs one job at a time because it
- * is CPU-heavy, while notification delivery runs several in parallel. Jobs linked to a BackgroundJob row are
- * tracked, so their status, attempts and errors appear on the System health page and failed jobs can be retried
- * safely. The worker also registers the repeatable maintenance schedules and shuts down gracefully on SIGTERM and
+ * Starts one BullMQ worker per queue with a concurrency suited to the work: OCR is CPU-heavy, so its concurrency is
+ * set by OCR_CONCURRENCY to fit the machine, while notification delivery runs several in parallel. Jobs linked to a
+ * BackgroundJob row are tracked, so their status, attempts and errors appear on the System health page and failed
+ * jobs can be retried safely. The worker also registers the repeatable maintenance schedules and shuts down gracefully on SIGTERM and
  * SIGINT.
  *
  * @author Kwasi Adabo Boakye
@@ -23,7 +23,7 @@ registerHandlers();
 
 const concurrency = {
   ingest: 2,
-  ocr: 1,
+  ocr: env.OCR_CONCURRENCY,
   fixity: 2,
   indexing: 4,
   reports: 2,

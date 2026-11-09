@@ -163,11 +163,14 @@ export async function assertPlacement(location, item, { override, overrideReason
  *
  * @param {object} data Validated item details, optionally with `locationId`, `override` and `overrideReason`.
  * @param {object} user Authenticated principal.
+ * @param {import('sequelize').Transaction} [transaction] Existing transaction, used when several boxes are
+ *   registered together.
  * @returns {Promise<object>} The new item.
  * @throws {AppError} When the barcode is taken, the location does not exist, or the placement is not allowed.
  */
-export async function createItem(data, user) {
-  return sequelize.transaction(async (t) => {
+export async function createItem(data, user, transaction) {
+  const run = (fn) => (transaction ? fn(transaction) : sequelize.transaction(fn));
+  return run(async (t) => {
     if (await models.PhysicalItem.findOne({ where: { barcode: data.barcode }, transaction: t }))
       throw conflict('Barcode already in use');
     const { locationId, override, overrideReason, ...rest } = data;
@@ -240,6 +243,8 @@ export async function moveItem(
     if (!item) throw notFound('Physical item');
     if (['issued', 'disposed', 'withdrawn'].includes(item.status))
       throw conflict(`An item that is ${item.status} cannot be moved here`);
+    if (item.status === 'in_digitisation')
+      throw conflict('This item is out for digitisation; it returns to its shelf when its batch is completed');
     const to = await models.StorageLocation.findByPk(toLocationId, { transaction: t });
     if (!to) throw notFound('Destination location');
     if (to.id === item.currentLocationId) throw badRequest('The item is already in that location');

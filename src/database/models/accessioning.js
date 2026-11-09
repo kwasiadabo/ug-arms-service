@@ -67,6 +67,9 @@ export default function defineAccessioning(sequelize) {
       confidentialityNotes: text(),
       status: status(TRANSFER_STATUSES, 'draft'),
       submittedById: fk(),
+      // True when an Archives reviewer (usually a Records Officer acting as the unit's liaison) prepared the
+      // transfer for a unit other than their own.
+      submittedOnBehalf: bool(),
       submittedAt: date(),
       reviewerId: fk(),
       decisionById: fk(),
@@ -186,8 +189,11 @@ export default function defineAccessioning(sequelize) {
       quantity: int(1),
       extent: str(255),
       condition: str(255),
+      // The department's own box number, carried over from the transfer inventory line.
+      boxNumber: str(60),
       status: status(['pending', 'accepted', 'rejected'], 'pending'),
       recordId: fk(),
+      // The registered box or other physical item that holds this item.
       physicalItemId: fk(),
     },
     { indexes: [{ fields: ['accessionId'] }] },

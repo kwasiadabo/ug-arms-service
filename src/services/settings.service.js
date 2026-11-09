@@ -53,6 +53,11 @@ export const DEFAULT_SETTINGS = {
     description: 'Failed logins before temporary lockout.',
   },
   'security.lockoutMinutes': { category: 'security', value: 15, description: 'Lockout duration in minutes.' },
+  'security.idleTimeoutMinutes': {
+    category: 'security',
+    value: 25,
+    description: 'Minutes without keyboard, mouse or touch activity before a signed-in user is signed out (0 = never).',
+  },
   'security.publicRegistration': {
     category: 'security',
     value: true,
@@ -62,6 +67,12 @@ export const DEFAULT_SETTINGS = {
     category: 'workflow',
     value: true,
     description: 'Prevent the creator or submitter of an item approving it.',
+  },
+  'workflow.requireCompleteAccessions': {
+    category: 'workflow',
+    value: true,
+    description:
+      'Refuse to submit or approve an accession while required information is missing (date, source, authority, extent, condition, provenance, rights, items).',
   },
   'workflow.twoPersonAccessChanges': {
     category: 'workflow',

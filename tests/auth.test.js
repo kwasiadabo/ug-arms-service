@@ -9,7 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import { anon, loginAs, USERS, PASSWORD, app } from './helpers.js';
 import request from 'supertest';
-import { models } from '../src/database/models/index.js';
+import { models, sequelize } from '../src/database/models/index.js';
 
 describe('authentication', () => {
   it('logs in, returns permissions and sets HTTP-only cookies', async () => {
@@ -111,6 +111,42 @@ describe('authentication', () => {
       .set('Cookie', [newRt, `ugarms_csrf=${csrf}`])
       .set('X-CSRF-Token', csrf);
     expect(r2.status).toBe(401);
+  });
+
+  it('refuses to refresh a session left unused for longer than the idle timeout', async () => {
+    const agent = request.agent(app);
+    const login = await agent.post('/api/v1/auth/login').send({ email: USERS.auditor, password: PASSWORD });
+    const userId = login.body.data.user.id;
+    const csrf = login.headers['set-cookie']
+      .find((c) => c.startsWith('ugarms_csrf='))
+      .split(';')[0]
+      .split('=')[1];
+    // Default timeout 25 minutes + 15-minute access token: 45 minutes without a refresh is past the limit.
+    await sequelize.query(
+      'UPDATE [UserSessions] SET [createdAt] = :at WHERE [userId] = :userId AND [revokedAt] IS NULL',
+      {
+        replacements: { at: new Date(Date.now() - 45 * 60_000), userId },
+      },
+    );
+    const res = await agent.post('/api/v1/auth/refresh').set('X-CSRF-Token', csrf);
+    expect(res.status).toBe(401);
+    expect(res.body.error.message).toMatch(/inactivity/);
+    expect(await models.UserSession.count({ where: { userId, revokedReason: 'idle_timeout' } })).toBeGreaterThan(0);
+    expect(await models.AuditEvent.count({ where: { action: 'auth.idle_timeout', resourceId: userId } })).toBe(1);
+  });
+
+  it('records an automatic sign-out after inactivity', async () => {
+    const client = await loginAs('readingRoom');
+    expect((await client.post('/api/v1/auth/logout').send({ reason: 'idle' })).status).toBe(204);
+    expect(await models.UserSession.count({ where: { userId: client.user.id, revokedReason: 'idle_timeout' } })).toBe(
+      1,
+    );
+    expect((await client.get('/api/v1/auth/me')).status).toBe(401);
+  });
+
+  it('publishes the idle timeout for the browser', async () => {
+    const res = await anon().get('/api/v1/settings/public');
+    expect(res.body.data['security.idleTimeoutMinutes']).toBe(25);
   });
 
   it('immediately blocks a deactivated user', async () => {

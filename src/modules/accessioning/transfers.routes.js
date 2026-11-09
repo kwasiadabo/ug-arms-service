@@ -3,8 +3,10 @@
  *
  * A transfer is a department's proposal to send records to the Archives. Departmental liaisons ("transfer.submit")
  * prepare and submit transfers for their own unit only; records officers and archivists ("transfer.review") review
- * every transfer and decide line by line.
+ * every transfer and decide line by line. When a department has no liaison, a records officer may prepare and submit
+ * the transfer on its behalf; another reviewer then decides on it.
  *
+ * - GET /inventory-template downloads a blank Excel or CSV inventory to fill in offline and import.
  * - GET / lists transfers visible to the caller, with filters and paging.
  * - POST / creates a draft transfer.
  * - GET /:id returns a transfer with its inventory, available actions, comments, revisions, documents and workflow
@@ -23,6 +25,7 @@
 
 import { Router } from 'express';
 import multer from 'multer';
+import ExcelJS from 'exceljs';
 import { z } from 'zod';
 import { Op } from 'sequelize';
 import { models } from '../../database/models/index.js';
@@ -34,6 +37,7 @@ import { paginationSchema, pageParams, orderBy, paged } from '../../utils/pagina
 import { badRequest } from '../../utils/errors.js';
 import { hasPerm } from '../../services/accessPolicy.service.js';
 import { history } from '../../services/workflow.service.js';
+import { getSetting } from '../../services/settings.service.js';
 import { parseTabular } from '../../services/spreadsheet.service.js';
 import { diskUpload } from '../../services/upload.service.js';
 import * as svc from './transfers.service.js';
@@ -69,6 +73,96 @@ const itemBody = z.object({
   confidentiality: optionalText(255),
   notes: optionalText(2000),
 });
+
+// Columns of the downloadable inventory template, in order. Each header is one of COLUMN_ALIASES below, so a filled-in
+// template imports without any column mapping.
+const TEMPLATE_COLUMNS = [
+  [
+    'Identifier',
+    18,
+    false,
+    'Your own file, volume or box reference. Must not repeat within the inventory.',
+    'HIST/ADM/12',
+  ],
+  ['Title', 48, true, 'What the item is. Required on every line.', 'Staff meeting minutes'],
+  ['Dates', 18, false, 'The dates as written on the item, in any form.', '1960–1965'],
+  ['From', 14, false, 'Earliest date: YYYY, YYYY-MM-DD or DD/MM/YYYY.', '1960'],
+  ['To', 14, false, 'Latest date, in the same forms. Not before From.', '1965'],
+  ['Format', 18, false, 'Physical form.', 'Paper file'],
+  ['Quantity', 10, false, 'Number of items, a positive whole number. Left empty, it counts as 1.', '2'],
+  [
+    'Extent',
+    16,
+    false,
+    'How much material the line covers, as a measure (Quantity is the count). Other examples: 3 volumes, 120 sheets, 2 archive boxes.',
+    '0.5 linear metres',
+  ],
+  [
+    'Box',
+    10,
+    false,
+    'The number written on the box the item is packed in, so the Archives can match the list to the boxes. Other examples: Box 3 of 12, B-07.',
+    '3',
+  ],
+  ['Condition', 18, false, 'Physical condition.', 'Fragile'],
+  ['Confidentiality', 20, false, 'Anything sensitive or confidential in the item.', 'Personnel details'],
+  ['Notes', 36, false, 'Anything else the Archives should know.', 'Two folders bound together'],
+];
+
+/**
+ * @openapi
+ * /transfers/inventory-template:
+ *   get: { tags: [Accessioning], summary: 'Blank inventory template to fill in offline and import (format=xlsx or csv)', responses: { 200: { description: The template file } } }
+ */
+router.get(
+  '/inventory-template',
+  validate({ query: z.object({ format: z.enum(['xlsx', 'csv']).default('xlsx') }) }),
+  async (req, res) => {
+    const headers = TEMPLATE_COLUMNS.map(([h]) => h);
+    if (req.query.format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="transfer-inventory-template.csv"');
+      // The byte-order mark makes Excel open the file as UTF-8.
+      res.send(`\uFEFF${headers.join(',')}\r\n`);
+      return;
+    }
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'UG-ARMS';
+    // The import reads the first sheet only, so the guidance sheet comes second.
+    const ws = wb.addWorksheet('Inventory', { views: [{ state: 'frozen', ySplit: 1 }] });
+    ws.columns = TEMPLATE_COLUMNS.map(([header, width]) => ({ header, width }));
+    ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F2A5C' } };
+    ws.getCell('B1').note = 'Required';
+    // Dates are kept as typed (text), so Excel does not turn 1960 or 15/03/1962 into a different date.
+    for (const col of ['C', 'D', 'E']) ws.getColumn(col).numFmt = '@';
+    ws.dataValidations.add('G2:G5001', {
+      type: 'whole',
+      operator: 'greaterThanOrEqual',
+      formulae: [1],
+      allowBlank: true,
+      showErrorMessage: true,
+      errorTitle: 'Quantity',
+      error: 'Enter a positive whole number, or leave it empty for 1.',
+    });
+    const guide = wb.addWorksheet('How to fill this in');
+    guide.columns = [
+      { header: 'Column', width: 18 },
+      { header: 'Required', width: 10 },
+      { header: 'What to enter', width: 70 },
+      { header: 'Example', width: 28 },
+    ];
+    guide.getRow(1).font = { bold: true };
+    for (const [header, , required, help, example] of TEMPLATE_COLUMNS)
+      guide.addRow([header, required ? 'Yes' : 'No', help, example]);
+    guide.addRow([]);
+    guide.addRow(['', '', 'One line per file, volume or box. Keep the column headings as they are.']);
+    guide.addRow(['', '', 'Save as .xlsx or .csv, then choose Import on the transfer and check the preview.']);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="transfer-inventory-template.xlsx"');
+    res.send(Buffer.from(await wb.xlsx.writeBuffer()));
+  },
+);
 
 /**
  * @openapi
@@ -123,7 +217,7 @@ router.post('/', requirePermission('transfer.submit'), validate({ body: submissi
 
 router.get('/:id', validate({ params: idParams }), async (req, res) => {
   const s = await svc.loadVisible(req.params.id, req.user);
-  const [items, revisions, comments, documents, hist, unit] = await Promise.all([
+  const [items, revisions, comments, documents, hist, unit, submittedBy, separationOfDuties] = await Promise.all([
     models.TransferInventoryItem.findAll({ where: { submissionId: s.id }, order: [['lineNumber', 'ASC']] }),
     models.TransferSubmissionRevision.findAll({
       where: { submissionId: s.id },
@@ -142,17 +236,20 @@ router.get('/:id', validate({ params: idParams }), async (req, res) => {
     listDocuments('transfer_submission', s.id),
     history('TransferSubmission', s.id),
     models.OrganisationUnit.findByPk(s.originatingUnitId, { attributes: ['id', 'name', 'code'] }),
+    s.submittedById ? models.User.findByPk(s.submittedById, { attributes: ['id', 'fullName'] }) : null,
+    getSetting('workflow.separationOfDuties'),
   ]);
   res.json({
     data: {
       ...s.get({ plain: true }),
       originatingUnit: unit,
+      submittedBy,
       items,
       revisions,
       comments,
       documents,
       history: hist,
-      availableActions: svc.actionsFor(s, req.user),
+      availableActions: svc.actionsFor(s, req.user, Boolean(separationOfDuties)),
       validation: svc.validateSubmission(s, items),
     },
   });
@@ -305,7 +402,9 @@ router.post('/:id/documents', validate({ params: idParams }), diskUpload(100).ar
 
 router.get('/:id/documents/:docId', validate({ params: z.object({ id: uuid, docId: uuid }) }), async (req, res) => {
   await svc.loadVisible(req.params.id, req.user);
-  await streamDocument('transfer_submission', req.params.id, req.params.docId, res);
+  await streamDocument('transfer_submission', req.params.id, req.params.docId, res, {
+    preview: req.query.preview === 'true',
+  });
 });
 
 router.post(

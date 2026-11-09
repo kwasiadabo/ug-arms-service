@@ -145,7 +145,7 @@ export const QUEUES = [
 
 /**
  * Counts the items waiting in each queue the user can act on. Departmental liaisons also see the queries raised on
- * their own unit's transfers.
+ * their own unit's transfers, and anyone who prepared a transfer on a department's behalf sees the queries on it.
  *
  * @param {object} user Authenticated principal.
  * @returns {Promise<Array<{ key: string, label: string, count: number, link: string }>>}
@@ -157,13 +157,15 @@ export async function pendingWork(user) {
     const count = await models[queue.model].count({ where: queue.where });
     out.push({ key: queue.key, label: queue.label, count, link: queue.link });
   }
-  // Departmental liaisons: their submissions needing a response.
-  if (hasPerm(user, 'transfer.submit') && user.organisationUnitId) {
+  // Departmental liaisons, and records officers acting for a department: submissions needing a response.
+  if (hasPerm(user, 'transfer.submit')) {
+    const mine = [{ submittedById: user.id }];
+    if (user.organisationUnitId) mine.push({ originatingUnitId: user.organisationUnitId });
     out.push({
       key: 'my_queries',
       label: 'Transfer queries to answer',
       count: await models.TransferSubmission.count({
-        where: { originatingUnitId: user.organisationUnitId, status: 'query_raised' },
+        where: { [Op.or]: mine, status: 'query_raised' },
       }),
       link: '/admin/transfers?status=query_raised',
     });

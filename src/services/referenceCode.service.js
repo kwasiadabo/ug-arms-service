@@ -43,6 +43,8 @@ export const DEFAULT_FORMATS = {
   digitisation_batch: 'UGA/DB/{YYYY}/{SEQ:4}',
   legal_hold: 'UGA/LH/{YYYY}/{SEQ:3}',
   receipt: 'UGA/RCPT/{YYYY}/{SEQ:5}',
+  // Barcodes generated for boxes registered without a pre-printed label; no slashes, for barcode scanners.
+  physical_item: 'UGA-BX-{SEQ:6}',
 };
 
 /**

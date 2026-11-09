@@ -15,6 +15,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -71,10 +72,13 @@ function meanConfidence(tsv) {
  * @returns {Promise<{ text: string, confidence: number|null }>}
  */
 async function ocrImageCli(filePath, language) {
-  const outBase = path.join(os.tmpdir(), `ocr-${process.pid}-${Date.now()}`);
+  // Unique per call: several OCR jobs run at once in the same process.
+  const outBase = path.join(os.tmpdir(), `ocr-${randomUUID()}`);
   await run(env.TESSERACT_PATH, [filePath, outBase, '-l', language, 'txt', 'tsv'], {
     timeout: 600_000,
     maxBuffer: 50 * 1024 * 1024,
+    // One thread per process, so that parallel jobs do not compete for the same cores.
+    env: { ...process.env, OMP_THREAD_LIMIT: '1' },
   });
   const [text, tsv] = await Promise.all([fs.readFile(`${outBase}.txt`, 'utf8'), fs.readFile(`${outBase}.tsv`, 'utf8')]);
   await Promise.all([fs.rm(`${outBase}.txt`, { force: true }), fs.rm(`${outBase}.tsv`, { force: true })]);

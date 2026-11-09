@@ -20,6 +20,8 @@ export const PHYSICAL_STATUSES = [
   'issued',
   'in_transit',
   'in_conservation',
+  // Out of storage for scanning in a digitisation batch; returns to its shelf when the batch ends.
+  'in_digitisation',
   'missing',
   'withdrawn',
   'disposed',
@@ -115,6 +117,7 @@ export default function definePhysical(sequelize) {
         'conservation',
         'audit_correction',
         'disposal',
+        'digitisation',
       ]),
       reason: req(1000),
       movedById: fk(false),

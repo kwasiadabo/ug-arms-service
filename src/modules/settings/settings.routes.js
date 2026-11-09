@@ -37,6 +37,7 @@ router.get('/public', async (req, res) => {
     'institution.locale',
     'institution.currency',
     'security.publicRegistration',
+    'security.idleTimeoutMinutes',
     'research.allowAnonymousEnquiries',
     'research.feesEnabled',
     'privacy.registrationNotice',

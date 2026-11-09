@@ -96,19 +96,20 @@ export async function listDocuments(ownerType, ownerId) {
 }
 
 /**
- * Streams a supporting document to the client as a download.
+ * Streams a supporting document to the client, as a download or, with `preview`, inline for the preview dialog.
  *
  * Infected documents are reported as not found. A document whose malware scan could not be completed is held until
- * it has been re-scanned and is never served unscanned. Every download is audited.
+ * it has been re-scanned and is never served unscanned. Every download and preview is audited.
  *
  * @param {string} ownerType "transfer_submission" or "accession".
  * @param {string} ownerId Identifier of the owner.
  * @param {string} docId Document identifier.
  * @param {import('express').Response} res Response to stream into.
+ * @param {{ preview?: boolean }} [options] Serve inline for previewing instead of as a download.
  * @returns {Promise<void>}
  * @throws {AppError} 404 when not found or infected, 409 when held for re-scanning.
  */
-export async function streamDocument(ownerType, ownerId, docId, res) {
+export async function streamDocument(ownerType, ownerId, docId, res, { preview = false } = {}) {
   const doc = await models.TransferDocument.findOne({ where: { id: docId, ownerType, ownerId } });
   if (!doc) throw notFound('Document');
   if (doc.malwareStatus === 'infected') throw notFound('Document');
@@ -117,13 +118,18 @@ export async function streamDocument(ownerType, ownerId, docId, res) {
     throw conflict('This document could not be scanned for malware and is held until it is re-scanned');
   const obj = await storage.get(doc.storageKey);
   await audit({
-    action: 'document.download',
+    action: preview ? 'document.preview' : 'document.download',
     resourceType: ownerType,
     resourceId: ownerId,
     metadata: { documentId: doc.id },
   });
   res.setHeader('Content-Type', doc.mediaType || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.originalFilename)}"`);
+  res.setHeader(
+    'Content-Disposition',
+    `${preview ? 'inline' : 'attachment'}; filename="${encodeURIComponent(doc.originalFilename)}"`,
+  );
+  // A preview is read by the page as data and never rendered as a page of its own.
+  if (preview) res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
   res.setHeader('X-Content-Type-Options', 'nosniff');
   if (obj.contentLength) res.setHeader('Content-Length', obj.contentLength);
   obj.body.pipe(res);

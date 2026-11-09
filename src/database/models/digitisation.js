@@ -53,6 +53,8 @@ export default function defineDigitisation(sequelize) {
       title: req(500),
       description: text(),
       sourceRecordId: fk(),
+      // The accession whose material the project digitises, when it was planned from one.
+      accessionId: fk(),
       qualityProfileId: fk(),
       status: status(['proposed', 'approved', 'active', 'completed', 'cancelled'], 'proposed'),
       priority: status(['low', 'normal', 'high', 'urgent'], 'normal'),
@@ -98,6 +100,8 @@ export default function defineDigitisation(sequelize) {
       batchId: fk(false),
       recordId: fk(),
       physicalItemId: fk(),
+      // The accession the item came in with: from the batch's plan, or from its box.
+      accessionId: fk(),
       sequence: int(1),
       label: req(500),
       expectedPages: int(),

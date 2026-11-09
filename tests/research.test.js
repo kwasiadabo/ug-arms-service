@@ -242,6 +242,186 @@ describe('Journey D: digitisation with QA and rework', () => {
   });
 });
 
+describe('boxes going out for digitisation', () => {
+  it('takes the boxes of a batch out of storage at the start and returns them when the batch ends', async () => {
+    const fonds = await publishedFonds(archivist, chief, { title: 'Boxes for scanning' });
+    const types = (await archivist.get('/api/v1/locations/types')).body.data;
+    const shelf = (
+      await archivist
+        .post('/api/v1/locations')
+        .send({ code: uniq('SH'), name: 'Shelf', typeId: types.find((x) => x.code === 'shelf').id })
+    ).body.data;
+    const box = async (title) =>
+      (await archivist.post('/api/v1/physical-items').send({ barcode: uniq('BX'), title, locationId: shelf.id })).body
+        .data;
+    const [a, b, c] = [await box('Box A'), await box('Box B'), await box('Box C')];
+    await archivist.post(`/api/v1/physical-items/${c.id}/report-missing`).send({ reason: 'Not on the shelf' });
+
+    const project = (
+      await archivist.post('/api/v1/digitisation/projects').send({ title: 'Scan boxes', sourceRecordId: fonds.id })
+    ).body.data;
+    await chief.post(`/api/v1/digitisation/projects/${project.id}/status`).send({ status: 'approved' });
+    const batch = async (items) => {
+      const id = (
+        await archivist
+          .post(`/api/v1/digitisation/projects/${project.id}/batches`)
+          .send({ operatorId: digitisation.user.id, ocrEnabled: false })
+      ).body.data.id;
+      await archivist.post(`/api/v1/digitisation/batches/${id}/items`).send({ items });
+      return id;
+    };
+    const go = (id, action, extra = {}) =>
+      digitisation.post(`/api/v1/digitisation/batches/${id}/transition`).send({ action, ...extra });
+    const status = async (x) => (await models.PhysicalItem.findByPk(x.id)).status;
+
+    // A batch holding a missing box cannot start, and nothing leaves storage.
+    const blocked = await batch([
+      { label: 'B', physicalItemId: b.id },
+      { label: 'C', physicalItemId: c.id },
+    ]);
+    const refused = await go(blocked, 'start');
+    expect(refused.status).toBe(422);
+    expect(refused.body.error.details.map((d) => d.message).join(' ')).toMatch(/is missing and cannot leave storage/);
+    expect(await status(b)).toBe('available');
+
+    // Starting takes the box out; its shelf stays recorded as where it returns.
+    const first = await batch([
+      { label: 'A', physicalItemId: a.id, recordId: fonds.id },
+      { label: 'Loose sheet', recordId: fonds.id },
+    ]);
+    expect((await go(first, 'start')).status).toBe(200);
+    const out = (await archivist.get(`/api/v1/physical-items/${a.id}`)).body.data;
+    expect(out.status).toBe('in_digitisation');
+    expect(out.currentLocation.id).toBe(shelf.id);
+    expect(out.movements[0]).toMatchObject({ movementType: 'digitisation', toLocationId: null });
+    expect(out.movements[0].reason).toMatch(/Out for digitisation in batch/);
+
+    // While out, it cannot be moved by hand or taken into a second batch.
+    const other = (
+      await archivist.post('/api/v1/locations').send({ code: uniq('SH'), name: 'Other shelf', typeId: shelf.typeId })
+    ).body.data;
+    const move = await archivist
+      .post(`/api/v1/physical-items/${a.id}/move`)
+      .send({ toLocationId: other.id, movementType: 'permanent', reason: 'Re-shelving' });
+    expect(move.status).toBe(409);
+    const second = await batch([{ label: 'A again', physicalItemId: a.id }]);
+    expect((await go(second, 'start')).body.error.details[0].message).toMatch(/out for digitisation in batch/);
+
+    // A box added while capture is under way leaves storage at once.
+    await archivist
+      .post(`/api/v1/digitisation/batches/${first}/items`)
+      .send({ items: [{ label: 'B', physicalItemId: b.id }] });
+    expect(await status(b)).toBe('in_digitisation');
+
+    // When the batch ends, both boxes return to their shelf.
+    expect(
+      (
+        await archivist
+          .post(`/api/v1/digitisation/batches/${first}/transition`)
+          .send({ action: 'fail', reason: 'Scanner fault' })
+      ).status,
+    ).toBe(200);
+    expect([await status(a), await status(b)]).toEqual(['available', 'available']);
+    const back = (await archivist.get(`/api/v1/physical-items/${a.id}`)).body.data;
+    expect(back.movements[0]).toMatchObject({ movementType: 'return', toLocationId: shelf.id });
+  });
+});
+
+describe('digitisation planned from an accession', () => {
+  it('links projects and batches to the accession and plans only material not yet digitised', async () => {
+    const fonds = await publishedFonds(archivist, chief, { title: 'Accessioned papers for scanning' });
+    const created = await archivist.post('/api/v1/accessions').send({
+      title: 'Faculty board papers',
+      sourceType: 'donor',
+      donorName: 'A donor',
+      accessionDate: '2026-11-06',
+      legalBasis: 'Deed of gift',
+      extent: '2 boxes',
+      physicalCondition: 'Good',
+      provenance: 'Kept by the donor',
+      rightsStatement: 'University of Ghana',
+    });
+    const accId = created.body.data.id;
+    await archivist.put(`/api/v1/accessions/${accId}/items`).send({
+      items: [
+        { description: 'Board minutes', quantity: 1 },
+        { description: 'Framed photograph', quantity: 1 },
+      ],
+    });
+    const summary = async () => (await archivist.get(`/api/v1/accessions/${accId}/digitisation`)).body.data;
+
+    // Not before approval.
+    expect((await summary()).canPlan).toBe(false);
+    expect((await archivist.post(`/api/v1/digitisation/accessions/${accId}/projects`).send({})).status).toBe(400);
+    await archivist.post(`/api/v1/accessions/${accId}/transition`).send({ action: 'submit' });
+    await chief.post(`/api/v1/accessions/${accId}/transition`).send({ action: 'start_review' });
+    expect((await chief.post(`/api/v1/accessions/${accId}/transition`).send({ action: 'approve' })).status).toBe(200);
+
+    // Two registered boxes, and a described photograph that is not in a box.
+    await models.AccessionRecordLink.create({ accessionId: accId, recordId: fonds.id });
+    const photo = await models.AccessionItem.findOne({
+      where: { accessionId: accId, description: 'Framed photograph' },
+    });
+    await photo.update({ recordId: fonds.id, status: 'accepted' });
+    const types = (await archivist.get('/api/v1/locations/types')).body.data;
+    const shelf = (
+      await archivist
+        .post('/api/v1/locations')
+        .send({ code: uniq('SH'), name: 'Shelf', typeId: types.find((x) => x.code === 'shelf').id })
+    ).body.data;
+    const box = async (title) =>
+      (
+        await archivist
+          .post('/api/v1/physical-items')
+          .send({ barcode: uniq('BX'), title, locationId: shelf.id, accessionId: accId })
+      ).body.data;
+    const [a, b] = [await box('Box 1'), await box('Box 2')];
+    expect((await summary()).counts).toEqual({ total: 3, digitised: 0, inBatch: 0, notStarted: 3 });
+
+    // A project proposed from the accession is linked to it and to its only description; it needs approval first.
+    const project = (await archivist.post(`/api/v1/digitisation/accessions/${accId}/projects`).send({})).body.data;
+    expect(project).toMatchObject({ accessionId: accId, sourceRecordId: fonds.id, status: 'proposed' });
+    expect(project.title).toMatch(/Faculty board papers/);
+    const plan = (body) => archivist.post(`/api/v1/digitisation/accessions/${accId}/batches`).send(body);
+    expect((await plan({ projectId: project.id })).status).toBe(400);
+    await chief.post(`/api/v1/digitisation/projects/${project.id}/status`).send({ status: 'approved' });
+
+    // The first batch takes box 1 and the unboxed photograph, each linked to the accession.
+    const first = await plan({ projectId: project.id, physicalItemIds: [a.id], operatorId: digitisation.user.id });
+    expect(first.status).toBe(201);
+    expect(first.body.data.items.map((i) => [i.physicalItemId, i.recordId, i.accessionId])).toEqual([
+      [a.id, fonds.id, accId],
+      [null, fonds.id, accId],
+    ]);
+    let s1 = await summary();
+    expect(s1.counts).toMatchObject({ inBatch: 2, notStarted: 1 });
+    expect(s1.projects[0]).toMatchObject({ id: project.id, linked: true });
+    expect(s1.projects[0].batches[0]).toMatchObject({ items: 2, status: 'planned' });
+
+    // The next batch takes only what is left, and then nothing remains to plan.
+    const second = await plan({ projectId: project.id });
+    expect(second.body.data.items.map((i) => i.physicalItemId)).toEqual([b.id]);
+    expect((await plan({ projectId: project.id })).status).toBe(400);
+
+    // A completed batch whose items passed quality review counts as digitised.
+    const firstBatch = await models.DigitisationBatch.findByPk(first.body.data.batch.id);
+    await models.DigitisationItem.update({ status: 'qa_passed' }, { where: { batchId: firstBatch.id } });
+    await firstBatch.update({ status: 'completed' });
+    s1 = await summary();
+    expect(s1.counts).toEqual({ total: 3, digitised: 2, inBatch: 1, notStarted: 0 });
+    expect(s1.boxes.find((x) => x.physicalItemId === a.id)).toMatchObject({ state: 'digitised' });
+
+    // A project for other material cannot be used to plan this accession's batches.
+    const other = (
+      await archivist
+        .post('/api/v1/digitisation/projects')
+        .send({ title: 'Unrelated project', sourceRecordId: fonds.id })
+    ).body.data;
+    await chief.post(`/api/v1/digitisation/projects/${other.id}/status`).send({ status: 'approved' });
+    expect((await plan({ projectId: other.id })).status).toBe(404);
+  });
+});
+
 describe('research request items', () => {
   it('stores a description requested twice as a single item', async () => {
     const fonds = await publishedFonds(archivist, chief, { title: 'Duplicate request check', accessLevel: 'open' });

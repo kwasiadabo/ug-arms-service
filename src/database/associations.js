@@ -209,6 +209,8 @@ export function applyAssociations(m) {
   // Digitisation & OCR
   belongs(m.DigitisationProject, m.ArchivalRecord, 'sourceRecordId', 'sourceRecord');
   belongs(m.DigitisationProject, m.QualityProfile, 'qualityProfileId', 'qualityProfile');
+  belongs(m.DigitisationProject, m.Accession, 'accessionId', 'accession');
+  has(m.Accession, m.DigitisationProject, 'accessionId', 'digitisationProjects');
   userRefs(m.DigitisationProject, 'approvedById', 'createdById');
   belongs(m.DigitisationBatch, m.DigitisationProject, 'projectId', 'project');
   has(m.DigitisationProject, m.DigitisationBatch, 'projectId', 'batches');
@@ -217,6 +219,7 @@ export function applyAssociations(m) {
   has(m.DigitisationBatch, m.DigitisationItem, 'batchId', 'items');
   belongs(m.DigitisationItem, m.ArchivalRecord, 'recordId', 'record');
   belongs(m.DigitisationItem, m.PhysicalItem, 'physicalItemId', 'physicalItem');
+  belongs(m.DigitisationItem, m.Accession, 'accessionId', 'accession');
   has(m.DigitisationItem, m.DigitalAsset, 'digitisationItemId', 'assets');
   belongs(m.QualityAssuranceReview, m.DigitisationBatch, 'batchId', 'batch');
   has(m.DigitisationBatch, m.QualityAssuranceReview, 'batchId', 'reviews');

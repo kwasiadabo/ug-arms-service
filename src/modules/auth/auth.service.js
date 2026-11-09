@@ -230,6 +230,25 @@ export async function refresh(refreshToken, meta) {
     throw unauthorized('Session has been revoked');
   }
   if (existing.expiresAt < new Date()) throw unauthorized('Session expired');
+  // The browser signs out after the idle timeout. This catches a browser that was closed or asleep instead: a
+  // session not refreshed for longer than the idle timeout plus one access-token lifetime has not been in use.
+  const idleMinutes = Number(await getSetting('security.idleTimeoutMinutes'));
+  if (
+    idleMinutes > 0 &&
+    existing.createdAt < new Date(Date.now() - (idleMinutes + env.ACCESS_TOKEN_TTL_MIN) * 60_000)
+  ) {
+    await models.UserSession.update(
+      { revokedAt: new Date(), revokedReason: 'idle_timeout' },
+      { where: { familyId: existing.familyId, revokedAt: null } },
+    );
+    await audit({
+      action: 'auth.idle_timeout',
+      resourceType: 'User',
+      resourceId: existing.userId,
+      actorType: 'anonymous',
+    });
+    throw unauthorized('You were signed out after a period of inactivity');
+  }
   const user = await models.User.findByPk(existing.userId);
   if (!user || user.status !== 'active') throw unauthorized('Account is not active');
 
@@ -251,18 +270,19 @@ export async function refresh(refreshToken, meta) {
  *
  * @param {string} [sessionId] Identifier of the current session.
  * @param {string} [refreshToken] Refresh token from the cookie.
+ * @param {boolean} [idle=false] Whether the browser signed out automatically after the idle timeout.
  * @returns {Promise<void>}
  */
-export async function logout(sessionId, refreshToken) {
+export async function logout(sessionId, refreshToken, idle = false) {
   const where = sessionId ? { id: sessionId } : refreshToken ? { refreshTokenHash: sha256(refreshToken) } : null;
   if (!where) return;
   const s = await models.UserSession.findOne({ where });
   if (s) {
     await models.UserSession.update(
-      { revokedAt: new Date(), revokedReason: 'logout' },
+      { revokedAt: new Date(), revokedReason: idle ? 'idle_timeout' : 'logout' },
       { where: { familyId: s.familyId, revokedAt: null } },
     );
-    await audit({ action: 'auth.logout', resourceType: 'User', resourceId: s.userId });
+    await audit({ action: idle ? 'auth.idle_timeout' : 'auth.logout', resourceType: 'User', resourceId: s.userId });
   }
 }
 

@@ -47,7 +47,7 @@ const PROJECT_STATUS_TRANSITIONS = {
  * Proposes a digitisation project with a newly allocated project code.
  *
  * @param {object} data Validated project details; an optional `sourceRecordId` must refer to an existing
- *   description.
+ *   description, and an optional `accessionId` to an approved accession.
  * @param {object} user Authenticated principal; recorded as the proposer.
  * @returns {Promise<object>} The new project.
  * @throws {AppError} 404 when the source description does not exist.
@@ -59,6 +59,12 @@ export async function createProject(data, user) {
       !(await models.ArchivalRecord.findByPk(data.sourceRecordId, { transaction: t, attributes: ['id'] }))
     )
       throw notFound('Source description');
+    if (data.accessionId) {
+      const a = await models.Accession.findByPk(data.accessionId, { transaction: t, attributes: ['id', 'status'] });
+      if (!a) throw notFound('Accession');
+      if (!['approved', 'closed'].includes(a.status))
+        throw badRequest('Material can be digitised once its accession is approved');
+    }
     const p = await models.DigitisationProject.create(
       { ...data, code: await generateReference('digitisation_project', t), status: 'proposed', createdById: user.id },
       { transaction: t },
@@ -128,8 +134,9 @@ export async function setProjectStatus(id, status, user, reason) {
  * @returns {Promise<object>} The new batch with its allocated batch number.
  * @throws {AppError} 404 when the project does not exist, 400 when it is not approved.
  */
-export async function createBatch(projectId, data) {
-  return sequelize.transaction(async (t) => {
+export async function createBatch(projectId, data, transaction) {
+  const run = (fn) => (transaction ? fn(transaction) : sequelize.transaction(fn));
+  return run(async (t) => {
     const p = await models.DigitisationProject.findByPk(projectId, { transaction: t });
     if (!p) throw notFound('Project');
     if (!['approved', 'active'].includes(p.status))
@@ -165,19 +172,163 @@ export async function createBatch(projectId, data) {
   });
 }
 
+// Batch states during which the batch's boxes and volumes are out of storage, in the digitisation studio.
+const OUT_FOR_CAPTURE = ['in_progress', 'processing', 'quality_review', 'rework_required', 'approved'];
+// Item statuses from which a box or volume can be taken out for digitisation.
+const CAN_GO_OUT = ['available', 'reserved'];
+
 /**
- * Adds items to capture to a batch that has not yet been submitted for processing. Items are numbered after the
+ * Tells whether a physical item is already out for digitisation in another batch.
+ *
+ * @param {string} physicalItemId The physical item.
+ * @param {string} batchId The batch to leave out of the check.
+ * @param {import('sequelize').Transaction} t Current transaction.
+ * @returns {Promise<object|null>} The other batch, if any.
+ */
+async function otherActiveBatch(physicalItemId, batchId, t) {
+  const other = await models.DigitisationItem.findOne({
+    where: { physicalItemId, batchId: { [Op.ne]: batchId } },
+    include: [
+      {
+        model: models.DigitisationBatch,
+        as: 'batch',
+        where: { status: OUT_FOR_CAPTURE },
+        attributes: ['id', 'batchNumber'],
+      },
+    ],
+    transaction: t,
+  });
+  return other?.batch || null;
+}
+
+/**
+ * Takes a batch's boxes and volumes out of storage for capture: each one becomes "in digitisation" and a
+ * digitisation movement is recorded, as an issue to the reading room is. Its shelf stays recorded as its location,
+ * because that is where it returns. Items already out for this batch (for example during rework) are left as they
+ * are; anything that cannot leave storage refuses the whole step, naming each item.
+ *
+ * @param {object} b The batch.
+ * @param {object[]} items The batch's items to take out.
+ * @param {object} user Authenticated principal.
+ * @param {import('sequelize').Transaction} t Current transaction.
+ * @returns {Promise<number>} Number of physical items taken out.
+ * @throws {AppError} 422 when an item is issued, missing, in conservation, withdrawn, disposed or in another batch.
+ */
+async function sendForDigitisation(b, items, user, t) {
+  const ids = [...new Set(items.map((i) => i.physicalItemId).filter(Boolean))];
+  const physical = await models.PhysicalItem.findAll({ where: { id: ids }, transaction: t, lock: t.LOCK.UPDATE });
+  const problems = [];
+  const toMove = [];
+  for (const pi of physical) {
+    const other = await otherActiveBatch(pi.id, b.id, t);
+    if (other)
+      problems.push({
+        path: pi.barcode,
+        message: `${pi.barcode} is out for digitisation in batch ${other.batchNumber}`,
+      });
+    else if (pi.status === 'in_digitisation') continue;
+    else if (!CAN_GO_OUT.includes(pi.status))
+      problems.push({
+        path: pi.barcode,
+        message: `${pi.barcode} is ${pi.status.replace(/_/g, ' ')} and cannot leave storage`,
+      });
+    else toMove.push(pi);
+  }
+  if (problems.length) throw validationError(problems, 'Some items cannot be taken out of storage for digitisation');
+  for (const pi of toMove) {
+    await models.PhysicalItemMovement.create(
+      {
+        itemId: pi.id,
+        fromLocationId: pi.currentLocationId,
+        toLocationId: null,
+        movementType: 'digitisation',
+        reason: `Out for digitisation in batch ${b.batchNumber}`,
+        movedById: user.id,
+        movedAt: new Date(),
+      },
+      { transaction: t },
+    );
+    await pi.update({ status: 'in_digitisation' }, { transaction: t });
+    await audit(
+      {
+        action: 'physical_item.out_for_digitisation',
+        resourceType: 'PhysicalItem',
+        resourceId: pi.id,
+        after: { batchId: b.id, batchNumber: b.batchNumber },
+      },
+      { transaction: t },
+    );
+  }
+  return toMove.length;
+}
+
+/**
+ * Returns a finished batch's boxes and volumes to storage: each one that is out for digitisation and not also held
+ * by another active batch becomes available again at its shelf, and a return movement is recorded.
+ *
+ * @param {object} b The batch.
+ * @param {object} user Authenticated principal.
+ * @param {import('sequelize').Transaction} t Current transaction.
+ * @returns {Promise<number>} Number of physical items returned.
+ */
+async function returnFromDigitisation(b, user, t) {
+  const items = await models.DigitisationItem.findAll({
+    where: { batchId: b.id },
+    attributes: ['physicalItemId'],
+    transaction: t,
+  });
+  const ids = [...new Set(items.map((i) => i.physicalItemId).filter(Boolean))];
+  const physical = await models.PhysicalItem.findAll({
+    where: { id: ids, status: 'in_digitisation' },
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+  let returned = 0;
+  for (const pi of physical) {
+    if (await otherActiveBatch(pi.id, b.id, t)) continue;
+    await models.PhysicalItemMovement.create(
+      {
+        itemId: pi.id,
+        fromLocationId: null,
+        toLocationId: pi.currentLocationId,
+        movementType: 'return',
+        reason: `Returned from digitisation, batch ${b.batchNumber}`,
+        movedById: user.id,
+        movedAt: new Date(),
+      },
+      { transaction: t },
+    );
+    await pi.update({ status: 'available' }, { transaction: t });
+    await audit(
+      {
+        action: 'physical_item.returned_from_digitisation',
+        resourceType: 'PhysicalItem',
+        resourceId: pi.id,
+        after: { batchId: b.id, batchNumber: b.batchNumber },
+      },
+      { transaction: t },
+    );
+    returned += 1;
+  }
+  return returned;
+}
+
+/**
+ * Adds items to capture to a batch that has not yet been submitted for processing. If capture is already under way,
+ * their boxes and volumes leave storage at once. Items are numbered after the
  * existing ones. A linked description must exist, and a linked physical item must exist and must not be issued to a
  * researcher.
  *
  * @param {string} batchId Identifier of the batch.
  * @param {object[]} items The items, each with a label and optional description, physical item and expected page
  *   count.
+ * @param {object} user Authenticated principal, recorded on the movements of items taken out of storage.
  * @returns {Promise<object[]>} The created items.
  * @throws {AppError} When the batch cannot accept items or a linked record is missing or unavailable.
  */
-export async function addItems(batchId, items) {
-  return sequelize.transaction(async (t) => {
+export async function addItems(batchId, items, user, transaction) {
+  const run = (fn) => (transaction ? fn(transaction) : sequelize.transaction(fn));
+  return run(async (t) => {
     const b = await models.DigitisationBatch.findByPk(batchId, { transaction: t, lock: t.LOCK.UPDATE });
     if (!b) throw notFound('Batch');
     if (!['planned', 'in_progress', 'rework_required'].includes(b.status))
@@ -187,18 +338,24 @@ export async function addItems(batchId, items) {
     for (const [i, it] of items.entries()) {
       if (it.recordId && !(await models.ArchivalRecord.findByPk(it.recordId, { transaction: t, attributes: ['id'] })))
         throw notFound('Description');
+      let accessionId = it.accessionId ?? null;
+      if (accessionId && !(await models.Accession.findByPk(accessionId, { transaction: t, attributes: ['id'] })))
+        throw notFound('Accession');
       if (it.physicalItemId) {
         const pi = await models.PhysicalItem.findByPk(it.physicalItemId, { transaction: t });
         if (!pi) throw notFound('Physical item');
         if (pi.status === 'issued') throw badRequest(`${pi.barcode} is currently issued to a researcher`);
+        accessionId ??= pi.accessionId;
       }
       rows.push(
         await models.DigitisationItem.create(
-          { ...it, batchId, sequence: max + i + 1, status: 'pending' },
+          { ...it, accessionId, batchId, sequence: max + i + 1, status: 'pending' },
           { transaction: t },
         ),
       );
     }
+    // Items added while capture is under way leave storage straight away.
+    if (OUT_FOR_CAPTURE.includes(b.status)) await sendForDigitisation(b, rows, user, t);
     await audit(
       {
         action: 'digitisation.items_added',
@@ -247,6 +404,9 @@ export async function progress(batchId) {
 /**
  * Performs a workflow action on a batch, with completeness checks at each stage.
  *
+ * - Starting capture takes the batch's boxes and volumes out of storage (status "in digitisation", with a
+ *   movement); it is refused if any of them is issued, missing, in conservation, withdrawn, disposed or in another
+ *   batch. Completing or failing the batch returns them to their shelves.
  * - Submitting capture requires every item to be captured or skipped.
  * - Completing processing requires every file to have finished processing.
  * - Approval requires every item to have passed quality review or been skipped, and must be done by someone other
@@ -298,6 +458,8 @@ export async function transitionBatch(batchId, { action, reason }, user) {
     }
     if (action === 'request_rework' && !reason)
       throw validationError([{ path: 'reason', message: 'Describe the rework required' }]);
+    if (action === 'start') await sendForDigitisation(b, items, user, t);
+    if (['complete', 'fail'].includes(action)) await returnFromDigitisation(b, user, t);
     await transition('digitisation_batch', b, action, {
       actor: user,
       reason,

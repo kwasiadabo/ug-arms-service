@@ -10,7 +10,10 @@
  * - GET /:id returns an accession with its items, linked descriptions, physical items, approvals, missing
  *   information, available actions, documents and history.
  * - PATCH /:id and PUT /:id/items edit the accession and its received items.
- * - POST /:id/transition performs a workflow action (submit, start review, query, approve, reject or close).
+ * - GET /:id/boxes and POST /:id/boxes list the accession's boxes and register them as physical items.
+ * - GET /:id/digitisation summarises the digitisation of the accession's material.
+ * - POST /:id/transition performs a workflow action (submit, start review, query, approve, reject, close, or recall
+ *   to draft by the officer).
  * - POST /:id/quarantine places the material in quarantine or releases it.
  * - POST /:id/link-records and POST /:id/create-collection connect the accession to the catalogue.
  * - GET /:id/receipt downloads the acknowledgement and transfer receipt as a PDF.
@@ -30,9 +33,12 @@ import { idParams, uuid, isoDate, optionalText } from '../../validators/common.j
 import { paginationSchema, pageParams, orderBy, paged } from '../../utils/pagination.js';
 import { badRequest, notFound } from '../../utils/errors.js';
 import { history } from '../../services/workflow.service.js';
+import { getSetting } from '../../services/settings.service.js';
 import { diskUpload } from '../../services/upload.service.js';
 import * as svc from './accessions.service.js';
 import { storeDocuments, listDocuments, streamDocument } from './documents.js';
+import { boxPlan, registerBoxes } from './boxes.js';
+import { accessionDigitisation } from '../digitisation/fromAccession.js';
 
 const router = Router();
 router.use(authenticate, requirePermission('accession.read'));
@@ -73,6 +79,7 @@ const itemSchema = z.object({
   quantity: z.number().int().min(1).optional(),
   extent: optionalText(255),
   condition: optionalText(255),
+  boxNumber: optionalText(60),
 });
 
 /**
@@ -175,7 +182,9 @@ router.get('/:id', validate({ params: idParams }), async (req, res) => {
       approvals,
       physicalItems,
       missing: svc.computeMissing(a, a.items),
-      availableActions: svc.actionsFor(a, req.user),
+      missingDetails: svc.describeMissing(a, a.items),
+      completenessRequired: Boolean(await getSetting('workflow.requireCompleteAccessions')),
+      availableActions: svc.actionsFor(a, req.user, svc.computeMissing(a, a.items).length),
     },
   });
 });
@@ -186,6 +195,66 @@ router.patch(
   validate({ params: idParams, body: body.partial().extend({ version: z.number().int().optional() }) }),
   async (req, res) => {
     res.json({ data: await svc.updateAccession(req.params.id, req.body, req.user) });
+  },
+);
+
+/**
+ * @openapi
+ * /accessions/{id}/boxes:
+ *   get: { tags: [Accessioning], summary: "The accession's boxes: accepted items grouped by the department's box number, and which are registered", responses: { 200: { description: Box plan } } }
+ *   post: { tags: [Accessioning], summary: Register boxes as physical items with barcodes and locations (all or nothing), responses: { 201: { description: Registered } } }
+ */
+/**
+ * @openapi
+ * /accessions/{id}/digitisation:
+ *   get: { tags: [Accessioning], summary: "Digitisation of the accession's material: projects, batches with progress, and each box's state", responses: { 200: { description: Summary } } }
+ */
+router.get('/:id/digitisation', validate({ params: idParams }), async (req, res) => {
+  res.json({ data: await accessionDigitisation(req.params.id) });
+});
+
+router.get('/:id/boxes', validate({ params: idParams }), async (req, res) => {
+  res.json({ data: await boxPlan(req.params.id) });
+});
+
+router.post(
+  '/:id/boxes',
+  requirePermission('physical.move'),
+  validate({
+    params: idParams,
+    body: z.object({
+      boxes: z
+        .array(
+          z.object({
+            boxNumber: z.string().trim().min(1).max(60),
+            barcode: z.string().trim().max(120).optional(),
+            generateBarcode: z.boolean().optional(),
+            title: optionalText(1000),
+            itemType: z
+              .enum([
+                'box',
+                'folder',
+                'volume',
+                'item',
+                'map',
+                'drawing',
+                'photograph',
+                'audiovisual_carrier',
+                'artefact',
+                'other',
+              ])
+              .optional(),
+            locationId: uuid,
+            override: z.boolean().optional(),
+            overrideReason: optionalText(1000),
+          }),
+        )
+        .min(1)
+        .max(500),
+    }),
+  }),
+  async (req, res) => {
+    res.status(201).json({ data: await registerBoxes(req.params.id, req.body.boxes, req.user) });
   },
 );
 
@@ -204,7 +273,7 @@ router.post(
   validate({
     params: idParams,
     body: z.object({
-      action: z.enum(['submit', 'start_review', 'query', 'approve', 'reject', 'close']),
+      action: z.enum(['submit', 'start_review', 'query', 'approve', 'reject', 'close', 'recall']),
       reason: z.string().trim().max(4000).optional(),
       itemDecisions: z
         .array(z.object({ itemId: uuid, decision: z.enum(['accepted', 'rejected']) }))
@@ -284,7 +353,7 @@ router.post(
 );
 
 router.get('/:id/documents/:docId', validate({ params: z.object({ id: uuid, docId: uuid }) }), async (req, res) => {
-  await streamDocument('accession', req.params.id, req.params.docId, res);
+  await streamDocument('accession', req.params.id, req.params.docId, res, { preview: req.query.preview === 'true' });
 });
 
 export default router;

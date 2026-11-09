@@ -38,6 +38,8 @@ export const WORKFLOWS = {
       approve: { from: ['under_review'], to: 'approved' },
       reject: { from: ['submitted', 'under_review'], to: 'rejected' },
       close: { from: ['approved', 'rejected'], to: 'closed' },
+      // The officer takes a submitted accession back to complete it (see transitionAccession for when).
+      recall: { from: ['submitted', 'under_review'], to: 'draft' },
     },
   },
   description: {

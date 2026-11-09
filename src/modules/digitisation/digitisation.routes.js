@@ -6,6 +6,8 @@
  *   approves, activates, completes or cancels a project.
  * - GET /quality-profiles and POST /quality-profiles manage the capture standards (resolution, colour, bit depth
  *   and formats).
+ * - POST /accessions/:id/projects and POST /accessions/:id/batches plan digitisation from an approved accession:
+ *   a project linked to it, then batches filled with its material not yet digitised.
  * - POST /projects/:id/batches creates a batch; GET /batches and GET /batches/:id list and show batches with their
  *   progress.
  * - POST /batches/:id/items adds items to capture; POST /batches/:id/transition moves the batch through capture,
@@ -28,6 +30,7 @@ import { paginationSchema, pageParams, orderBy, paged } from '../../utils/pagina
 import { notFound } from '../../utils/errors.js';
 import { history } from '../../services/workflow.service.js';
 import * as svc from './digitisation.service.js';
+import { proposeProjectForAccession, planBatchFromAccession } from './fromAccession.js';
 
 const router = Router();
 router.use(authenticate, requireAnyPermission('digitisation.manage', 'digitisation.capture', 'digitisation.qa'));
@@ -63,6 +66,53 @@ router.get(
   },
 );
 
+/**
+ * @openapi
+ * /digitisation/accessions/{id}/projects:
+ *   post: { tags: [Digitisation], summary: Propose a project to digitise an approved accession (digitisation.manage), responses: { 201: { description: Created } } }
+ * /digitisation/accessions/{id}/batches:
+ *   post: { tags: [Digitisation], summary: "Create a batch filled with the accession's material not yet digitised (digitisation.manage)", responses: { 201: { description: Created } } }
+ */
+router.post(
+  '/accessions/:id/projects',
+  requirePermission('digitisation.manage'),
+  validate({
+    params: idParams,
+    body: z.object({
+      title: z.string().trim().min(3).max(500).optional(),
+      description: optionalText(20000),
+      sourceRecordId: uuid.nullable().optional(),
+      qualityProfileId: uuid.nullable().optional(),
+      priority: z.enum(['low', 'normal', 'high', 'urgent']).default('normal'),
+    }),
+  }),
+  async (req, res) => {
+    res.status(201).json({ data: await proposeProjectForAccession(req.params.id, req.body, req.user) });
+  },
+);
+
+router.post(
+  '/accessions/:id/batches',
+  requirePermission('digitisation.manage'),
+  validate({
+    params: idParams,
+    body: z.object({
+      projectId: uuid,
+      physicalItemIds: z.array(uuid).max(1000).optional(),
+      includeUnboxed: z.boolean().optional(),
+      operatorId: uuid.nullable().optional(),
+      resolutionDpi: z.number().int().min(50).max(10000).optional(),
+      colourProfile: optionalText(80),
+      bitDepth: z.number().int().min(1).max(64).optional(),
+      ocrEnabled: z.boolean().optional(),
+      ocrLanguage: z.string().trim().max(40).optional(),
+    }),
+  }),
+  async (req, res) => {
+    res.status(201).json({ data: await planBatchFromAccession(req.params.id, req.body, req.user) });
+  },
+);
+
 router.post(
   '/projects',
   requirePermission('digitisation.manage'),
@@ -71,6 +121,7 @@ router.post(
       title: z.string().trim().min(3).max(500),
       description: optionalText(20000),
       sourceRecordId: uuid.nullable().optional(),
+      accessionId: uuid.nullable().optional(),
       qualityProfileId: uuid.nullable().optional(),
       priority: z.enum(['low', 'normal', 'high', 'urgent']).default('normal'),
       startDate: isoDate,
@@ -86,6 +137,7 @@ router.get('/projects/:id', validate({ params: idParams }), async (req, res) => 
   const p = await models.DigitisationProject.findByPk(req.params.id, {
     include: [
       { model: models.ArchivalRecord, as: 'sourceRecord', attributes: ['id', 'referenceCode', 'title'] },
+      { model: models.Accession, as: 'accession', attributes: ['id', 'accessionNumber', 'title'] },
       { model: models.QualityProfile, as: 'qualityProfile' },
       { model: models.User, as: 'approvedBy', attributes: ['id', 'fullName'] },
       {
@@ -262,6 +314,7 @@ router.post(
             label: z.string().trim().min(1).max(500),
             recordId: uuid.nullable().optional(),
             physicalItemId: uuid.nullable().optional(),
+            accessionId: uuid.nullable().optional(),
             expectedPages: z.number().int().min(0).max(100000).optional(),
             notes: optionalText(2000),
           }),
@@ -271,7 +324,7 @@ router.post(
     }),
   }),
   async (req, res) => {
-    res.status(201).json({ data: await svc.addItems(req.params.id, req.body.items) });
+    res.status(201).json({ data: await svc.addItems(req.params.id, req.body.items, req.user) });
   },
 );
 

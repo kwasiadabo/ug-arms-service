@@ -17,6 +17,8 @@ import { normaliseDate, csvSafe, assertSafeXlsx } from '../src/services/spreadsh
 import { sanitiseSuggestions, SUGGESTIBLE_FIELDS } from '../src/modules/ai/ai.service.js';
 import { normaliseName } from '../src/modules/cataloguing/authority.routes.js';
 import { retentionWindow, protectAsset, PROTECTED_ROLES } from '../src/services/objectLock.service.js';
+import { code128Png } from '../src/modules/locations/labels.js';
+import { describeMissing } from '../src/modules/accessioning/accessions.service.js';
 
 describe('metadata validation', () => {
   it('enforces level placement', () => {
@@ -198,5 +200,39 @@ describe('Object Lock retention', () => {
     expect(await protectAsset('00000000-0000-0000-0000-000000000000')).toEqual({
       skipped: 'Object Lock is not enabled',
     });
+  });
+});
+
+describe('label barcodes', () => {
+  it('draws a Code 128 barcode for printable ASCII codes', async () => {
+    const png = await code128Png('UGA-BX-000123');
+    expect(png.subarray(1, 4).toString()).toBe('PNG');
+  });
+  it('leaves codes outside ASCII to the QR code, because scanners would read them back wrongly', async () => {
+    expect(await code128Png('BOÎTE-7')).toBeNull();
+  });
+});
+
+describe('missing accession information', () => {
+  const fromTransfer = {
+    transferSubmissionId: 't1',
+    accessionDate: '2026-11-04',
+    sourceUnitId: 'u1',
+    transferAuthority: 'Memo 12/2026',
+    extent: '0.5 linear metres',
+  };
+  it('explains that condition, provenance and rights are never on a transfer, and points to the condition notes', () => {
+    const items = [{ condition: 'Fragile' }, { condition: 'Water damage' }, { condition: '' }];
+    const details = describeMissing(fromTransfer, items);
+    expect(details.map((d) => d.key)).toEqual(['physicalCondition', 'provenance', 'rightsStatement']);
+    expect(details[0].origin).toMatch(/Not asked for on the transfer form/);
+    expect(details[0].origin).toMatch(/2 received items carry the department's condition notes: Fragile; Water damage/);
+    expect(details[1].fix).toEqual({ kind: 'fields', fields: ['provenance', 'custodialHistory'] });
+  });
+  it('says what is simply not recorded on an accession entered by hand, and sends missing items to the list', () => {
+    const details = describeMissing({ donorName: 'Estate of a former lecturer' }, []);
+    expect(details.find((d) => d.key === 'provenance').origin).toBe('Not recorded yet on this accession.');
+    expect(details.find((d) => d.key === 'items').fix).toEqual({ kind: 'items' });
+    expect(details.find((d) => d.key === 'source')).toBeUndefined();
   });
 });

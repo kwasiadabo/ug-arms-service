@@ -367,7 +367,7 @@ export async function processAsset(assetId) {
 }
 
 /**
- * Performs the ingest processing of one asset that is waiting to be processed.
+ * Performs the ingest processing of one asset that is waiting to be processed, or whose earlier attempt failed.
  *
  * - Technical metadata is extracted according to the type (image, PDF or audio/video), plus Tika metadata when
  *   enabled; extraction problems are recorded as a warning rather than failing the ingest.
@@ -382,14 +382,17 @@ export async function processAsset(assetId) {
  * deleted.
  *
  * @param {string} assetId Identifier of the asset.
- * @returns {Promise<object>} `{ status: 'available' }`, or `{ skipped: true }` when the asset is not waiting to be
- *   processed.
+ * @returns {Promise<object>} `{ status: 'available' }`, or `{ skipped: true }` when the asset is neither waiting to be
+ *   processed nor failed.
  */
 async function ingestAsset(assetId) {
   const asset = await models.DigitalAsset.findByPk(assetId);
-  if (!asset || asset.status !== 'processing') return { skipped: true };
-  const tmp = await downloadToTemp(asset.storageKey, asset.originalFilename);
+  if (!asset || !['processing', 'failed'].includes(asset.status)) return { skipped: true };
+  // A retry of a failed attempt counts as processing again, so a batch cannot move on while it runs.
+  if (asset.status === 'failed') await asset.update({ status: 'processing', ingestError: null });
+  let tmp;
   try {
+    tmp = await downloadToTemp(asset.storageKey, asset.originalFilename);
     const tech = { mediaType: asset.mediaType, size: Number(asset.sizeBytes) };
     const patch = {};
     try {
@@ -482,7 +485,7 @@ async function ingestAsset(assetId) {
     });
     throw err;
   } finally {
-    await fsp.rm(tmp.dir, { recursive: true, force: true });
+    if (tmp) await fsp.rm(tmp.dir, { recursive: true, force: true });
   }
 }
 

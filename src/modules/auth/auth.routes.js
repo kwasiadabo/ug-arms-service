@@ -162,10 +162,10 @@ router.post('/refresh', async (req, res) => {
 
 /** @openapi
  * /auth/logout:
- *   post: { tags: [Auth], summary: Revoke the current session, responses: { 204: { description: Signed out } } }
+ *   post: { tags: [Auth], summary: 'Revoke the current session; body {"reason":"idle"} records an automatic sign-out after inactivity', responses: { 204: { description: Signed out } } }
  */
 router.post('/logout', async (req, res) => {
-  await auth.logout(null, req.cookies?.[REFRESH_COOKIE]);
+  await auth.logout(null, req.cookies?.[REFRESH_COOKIE], req.body?.reason === 'idle');
   clearAuthCookies(res);
   res.status(204).end();
 });

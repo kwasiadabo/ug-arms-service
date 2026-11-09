@@ -35,7 +35,18 @@ const ACTION_PERMISSION = {
   approve: 'accession.approve',
   reject: 'accession.approve',
   close: 'accession.approve',
+  recall: 'accession.create',
 };
+
+/**
+ * Tells whether an accession may be taken back to draft by an officer: any time before the review starts, and during
+ * a review only while required information is missing, because approval is blocked until it is completed.
+ *
+ * @param {object} a The accession.
+ * @param {number} missingCount Number of missing pieces of information.
+ * @returns {boolean}
+ */
+const canRecall = (a, missingCount) => a.status === 'submitted' || (a.status === 'under_review' && missingCount > 0);
 
 /**
  * Lists the information an approver needs that is not yet recorded: accession date, source, transfer authority or
@@ -56,6 +67,86 @@ export function computeMissing(a, items) {
   if (!a.rightsStatement) missing.push('rightsStatement');
   if (!items.length) missing.push('items');
   return missing;
+}
+
+/**
+ * Explains each piece of missing information: what it is, where it was expected to come from, a hint for filling it
+ * in and the accession fields (or the items list) that fix it.
+ *
+ * An accession created from a transfer copies the originating unit, contact, transfer authority, estimated extent and
+ * item quantities. The transfer form does not ask for physical condition, provenance or rights, so those are always
+ * missing until an archivist records them, through nobody's mistake.
+ *
+ * @param {object} a The accession.
+ * @param {object[]} items Its received items.
+ * @returns {Array<{ key: string, label: string, origin: string, hint: string, fix: { kind: 'fields', fields:
+ *   string[] } | { kind: 'items' } }>} One entry per missing piece, in the order of `computeMissing`.
+ */
+export function describeMissing(a, items) {
+  const fromTransfer = Boolean(a.transferSubmissionId);
+  const notOnTransfer = 'Not asked for on the transfer form, so it is never carried over from the department.';
+  const notRecorded = 'Not recorded yet on this accession.';
+  const conditions = [...new Set(items.map((i) => i.condition?.trim()).filter(Boolean))];
+  const withCondition = items.filter((i) => i.condition?.trim()).length;
+  const details = {
+    accessionDate: {
+      label: 'Accession date',
+      origin: notRecorded,
+      hint: 'The date the Archives took custody of the material.',
+      fix: { kind: 'fields', fields: ['accessionDate'] },
+    },
+    source: {
+      label: 'Source',
+      origin: 'No originating unit or donor is recorded.',
+      hint: 'Name the donor or depositor who gave the material.',
+      fix: { kind: 'fields', fields: ['donorName'] },
+    },
+    transferAuthorityOrLegalBasis: {
+      label: 'Transfer authority or legal basis',
+      origin: fromTransfer ? 'The transfer was accepted without a transfer authority.' : notRecorded,
+      hint: 'The memo, decision, retention schedule or deposit agreement that allows the Archives to hold it.',
+      fix: { kind: 'fields', fields: ['transferAuthority', 'legalBasis'] },
+    },
+    extentOrQuantity: {
+      label: 'Extent or quantity',
+      origin: fromTransfer ? 'The transfer gave no estimated extent.' : notRecorded,
+      hint: 'How much material was received, for example 0.5 linear metres or 12 boxes.',
+      fix: { kind: 'fields', fields: ['extent', 'quantity'] },
+    },
+    physicalCondition: {
+      label: 'Physical condition',
+      origin: fromTransfer
+        ? `${notOnTransfer}${
+            withCondition
+              ? ` ${withCondition} received item${withCondition === 1 ? '' : 's'} carry the department's condition notes: ${conditions.slice(0, 4).join('; ')}.`
+              : ''
+          }`
+        : notRecorded,
+      hint: 'Record the overall state after inspecting the material: damage, mould, pests, fragile items.',
+      fix: { kind: 'fields', fields: ['physicalCondition'] },
+    },
+    provenance: {
+      label: 'Provenance',
+      origin: fromTransfer ? notOnTransfer : notRecorded,
+      hint: fromTransfer
+        ? 'Who created and kept the records before they came to the Archives. The originating unit and the reason given on the transfer are a starting point.'
+        : 'Who created and kept the material before it came to the Archives.',
+      fix: { kind: 'fields', fields: ['provenance', 'custodialHistory'] },
+    },
+    rightsStatement: {
+      label: 'Rights statement',
+      origin: fromTransfer ? notOnTransfer : notRecorded,
+      hint: 'Who holds copyright and what copying is allowed. Confirm against the University’s rights policy.',
+      fix: { kind: 'fields', fields: ['rightsStatement'] },
+    },
+    items: {
+      label: 'Received items',
+      origin: fromTransfer ? 'No transfer lines were accepted into this accession.' : 'No items are listed yet.',
+      hint: 'List what was received, one item per file, volume or box.',
+      fix: { kind: 'items' },
+    },
+  };
+  return computeMissing(a, items).map((key) => ({ key, ...details[key] }));
 }
 
 /**
@@ -169,9 +260,14 @@ export async function replaceItems(id, items) {
 /**
  * Performs a workflow action on an accession.
  *
- * - Submitting records the missing information and requires at least one item.
+ * - Submitting and approving are refused while required information is missing (`computeMissing`), unless the
+ *   "workflow.requireCompleteAccessions" setting is off; the refusal lists each missing piece and where it comes
+ *   from. With the setting off, submitting records what is missing for the approver. At least one item is always
+ *   required.
  * - Approving, querying and rejecting are refused to the person who created or submitted the accession; querying
  *   and rejecting require a reason.
+ * - Recalling takes a submitted accession back to draft so the officer can complete it: before the review starts,
+ *   or during a review while information is missing. Approvers are notified.
  * - Approval is refused while the accession is in quarantine, requires a decision for every item (pending items are
  *   accepted by default) and at least one accepted item.
  *
@@ -199,6 +295,19 @@ export async function transitionAccession(id, { action, reason, itemDecisions },
       a.missingInformation = missing;
       if (!items.length) throw validationError([{ path: 'items', message: 'Add at least one item before submitting' }]);
     }
+    if (
+      ['submit', 'approve'].includes(action) &&
+      missing.length &&
+      (await getSetting('workflow.requireCompleteAccessions'))
+    )
+      throw validationError(
+        describeMissing(a, items).map((m) => ({ path: m.key, message: `${m.label}: ${m.origin} ${m.hint}` })),
+        action === 'submit'
+          ? 'Complete the missing information before submitting'
+          : 'This accession is missing required information. Query it back to the officer, or complete it, before approval',
+      );
+    if (action === 'recall' && !canRecall(a, missing.length))
+      throw badRequest('The review has started and nothing is missing; ask the approver to query it back instead');
     if (['approve', 'reject', 'query'].includes(action)) {
       await assertSeparationOfDuties(
         user.id,
@@ -256,6 +365,19 @@ export async function transitionAccession(id, { action, reason, itemDecisions },
           eventType: 'accession.submitted',
           title: `Accession awaiting review: ${a.accessionNumber}`,
           body: `${a.title}${missing.length ? `\nMissing information: ${missing.join(', ')}` : ''}`,
+          link: `/admin/accessions/${a.id}`,
+          entityType: 'Accession',
+          entityId: a.id,
+        },
+        { transaction: t },
+      );
+    } else if (action === 'recall') {
+      await notifyPermissionHolders(
+        ['accession.approve'],
+        {
+          eventType: 'accession.recalled',
+          title: `Accession returned to draft: ${a.accessionNumber}`,
+          body: `${user.fullName} took "${a.title}" back to complete it${reason ? `: ${reason}` : '.'}`,
           link: `/admin/accessions/${a.id}`,
           entityType: 'Accession',
           entityId: a.id,
@@ -485,11 +607,16 @@ export async function receiptPdf(id, user) {
 
 /**
  * Lists the workflow actions this user may take on an accession now, given its state and the user's permissions.
+ * Recall is offered only when it is allowed (before the review starts, or while information is missing).
  *
  * @param {object} a The accession.
  * @param {object} user Authenticated principal.
+ * @param {number} [missingCount=0] Number of missing pieces of information, which decides whether a review in
+ *   progress may be recalled.
  * @returns {string[]} The available action names.
  */
-export function actionsFor(a, user) {
-  return availableActions('accession', a.status).filter((x) => hasPerm(user, ACTION_PERMISSION[x]));
+export function actionsFor(a, user, missingCount = 0) {
+  return availableActions('accession', a.status).filter(
+    (x) => hasPerm(user, ACTION_PERMISSION[x]) && (x !== 'recall' || canRecall(a, missingCount)),
+  );
 }

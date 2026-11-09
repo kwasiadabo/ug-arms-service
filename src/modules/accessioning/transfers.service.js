@@ -119,7 +119,9 @@ export function validateSubmission(s, items) {
 }
 
 /**
- * Creates a draft transfer. Liaisons may only create transfers for their own organisation unit.
+ * Creates a draft transfer. Liaisons may only create transfers for their own organisation unit. Reviewers, usually
+ * a Records Officer acting as the liaison for a department that has none, may prepare one for any unit; it is then
+ * marked as submitted on behalf of that unit.
  *
  * @param {object} data Validated transfer details.
  * @param {object} user Authenticated principal.
@@ -129,13 +131,19 @@ export function validateSubmission(s, items) {
 export async function createSubmission(data, user) {
   if (!hasPerm(user, 'transfer.review') && data.originatingUnitId !== user.organisationUnitId)
     throw forbidden('You can only prepare transfers for your own unit');
+  const submittedOnBehalf = data.originatingUnitId !== user.organisationUnitId;
   return sequelize.transaction(async (t) => {
     const s = await models.TransferSubmission.create(
-      { ...data, status: 'draft', submittedById: user.id },
+      { ...data, status: 'draft', submittedById: user.id, submittedOnBehalf },
       { transaction: t },
     );
     await audit(
-      { action: 'transfer.create', resourceType: 'TransferSubmission', resourceId: s.id, after: data },
+      {
+        action: 'transfer.create',
+        resourceType: 'TransferSubmission',
+        resourceId: s.id,
+        after: { ...data, submittedOnBehalf },
+      },
       { transaction: t },
     );
     return s;
@@ -164,6 +172,13 @@ export async function updateSubmission(id, data, user) {
     )
       throw forbidden();
     const before = s.get({ plain: true });
+    if (data.originatingUnitId && data.originatingUnitId !== s.originatingUnitId) {
+      const preparer = await models.User.findByPk(s.submittedById, {
+        attributes: ['organisationUnitId'],
+        transaction: t,
+      });
+      data = { ...data, submittedOnBehalf: data.originatingUnitId !== preparer?.organisationUnitId };
+    }
     await s.update(data, { transaction: t });
     const d = diff(before, s);
     await audit(
@@ -371,7 +386,7 @@ export async function transitionSubmission(id, { action, reason, itemDecisions }
 /**
  * Creates a draft accession from an accepted or partially accepted transfer.
  *
- * Only accepted lines are copied as received items, and the transfer's details (source unit, contact, authority,
+ * Only accepted lines are copied as received items, with the department's box numbers, and the transfer's details (source unit, contact, authority,
  * dates and extent) are carried across. Calling it again returns the accession already created instead of making a
  * second one.
  *
@@ -432,6 +447,7 @@ export async function createAccessionFromSubmission(id, user) {
         quantity: i.quantity,
         extent: i.extent,
         condition: i.condition,
+        boxNumber: i.boxNumber,
         status: 'pending',
       })),
       { transaction: t },
@@ -452,16 +468,20 @@ export async function createAccessionFromSubmission(id, user) {
 
 /**
  * Lists the workflow actions this user may take on a transfer now. Submitting, resubmitting and cancelling are open
- * to the transfer's own unit; every other action is for reviewers only.
+ * to the transfer's own unit; every other action is for reviewers only. A reviewer who prepared the transfer on a
+ * department's behalf is not offered the review actions, because separation of duties leaves the decision to
+ * another reviewer.
  *
  * @param {object} s The transfer.
  * @param {object} user Authenticated principal.
+ * @param {boolean} [separationOfDuties=true] Whether the separation-of-duties setting is on.
  * @returns {string[]} The available action names.
  */
-export function actionsFor(s, user) {
+export function actionsFor(s, user, separationOfDuties = true) {
   const reviewer = hasPerm(user, 'transfer.review');
   const own = s.submittedById === user.id || s.originatingUnitId === user.organisationUnitId;
+  const preparer = separationOfDuties && s.submittedById === user.id;
   return availableActions('transfer', s.status).filter((a) =>
-    ['submit', 'resubmit', 'cancel'].includes(a) ? own || reviewer : reviewer,
+    ['submit', 'resubmit', 'cancel'].includes(a) ? own || reviewer : reviewer && !preparer,
   );
 }
