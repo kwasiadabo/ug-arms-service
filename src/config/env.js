@@ -117,6 +117,9 @@ const schema = z.object({
   SEED_ADMIN_PASSWORD: z.string().min(12, 'SEED_ADMIN_PASSWORD must be at least 12 characters').optional(),
   SEED_DEMO_DATA: bool.default(true),
   LOG_LEVEL: z.string().default('info'),
+  // "json" or "pretty"; unset, logs are pretty in development and JSON in production. Containers set json because
+  // their images leave out the development-only pretty printer.
+  LOG_FORMAT: z.enum(['json', 'pretty']).optional(),
 });
 
 const parsed = schema.safeParse(process.env);

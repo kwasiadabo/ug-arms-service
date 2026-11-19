@@ -657,17 +657,13 @@ export async function up() {
     archivist,
   );
   await setProjectStatus(project.id, 'approved', chief, 'Demonstration approval');
-  const batch = await createBatch(
-    project.id,
-    {
-      operatorId: digitiser.id,
-      resolutionDpi: 600,
-      colourProfile: 'Adobe RGB (1998)',
-      captureDevice: 'Demonstration scanner',
-      ocrEnabled: false,
-    },
-    archivist,
-  );
+  const batch = await createBatch(project.id, {
+    operatorId: digitiser.id,
+    resolutionDpi: 600,
+    colourProfile: 'Adobe RGB (1998)',
+    captureDevice: 'Demonstration scanner',
+    ocrEnabled: false,
+  });
   await addItems(
     batch.id,
     [

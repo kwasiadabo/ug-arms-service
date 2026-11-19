@@ -1,6 +1,7 @@
 node_modules/
 coverage/
 .env
+.env.migrator
 .env.local
 *.log
 logs/*

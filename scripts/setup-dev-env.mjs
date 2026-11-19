@@ -52,7 +52,7 @@ set('S3_SECRET_KEY', 'ugarms-dev-secret');
 set('SMTP_HOST', 'localhost');
 set('SMTP_PORT', '1028');
 set('MAIL_FROM', '"UG Archives (dev) <no-reply@ugarms.local>"');
-set('CLAMAV_ENABLED', 'true'); // requires: docker compose --profile scan up -d clamav
+set('CLAMAV_ENABLED', 'true'); // requires: docker compose up -d clamav
 set('SEED_ADMIN_EMAIL', 'admin@ugarms.local');
 set('SEED_ADMIN_PASSWORD', demoPassword);
 set('SEED_DEMO_DATA', 'true');
