@@ -1,0 +1,90 @@
+# SQL Server for UG-ARMS on a Dokploy server (Docker Compose deployment).
+#
+# Every setting comes from the deployment's Environment tab: Dokploy writes those variables to a .env file next to
+# this compose file, and Compose fills in the ${...} values below from it. See .env.example in this folder for the
+# list. Deployment stops with a clear message if a required variable is missing.
+#
+# Two services:
+#   mssql       the database server. Reachable by the backend as  ugarms-mssql:1433  on dokploy-network.
+#   mssql-init  runs once after the server is healthy, then exits. It creates the database DB_NAME and the login
+#               DB_USER (owner of that database only, not a server administrator), and resets that login's password
+#               to DB_PASSWORD, so changing the password in Dokploy and redeploying rotates it. Safe to rerun: it
+#               never drops or empties anything.
+#
+# The backend then connects with  DB_HOST=ugarms-mssql  DB_PORT=1433  DB_NAME  DB_USER  DB_PASSWORD,
+# never as sa. The backend's own db-init step creates the tables and seeds the first administrator.
+#
+# This file is for servers only. On a development machine use the docker-compose.yml at the top of the UG_Archives
+# workspace instead.
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in the Environment tab}
+      # Express is free but limited (10 GB per database, 4 cores, about 1.4 GB of memory for caching). Developer is
+      # free but must not be used in production. Standard or Enterprise need a licence you have bought.
+      MSSQL_PID: ${MSSQL_PID:-Express}
+      MSSQL_MEMORY_LIMIT_MB: ${MSSQL_MEMORY_LIMIT_MB:-2048}
+      TZ: ${TZ:-Africa/Accra}
+    # Not published to the internet. Other containers reach it over dokploy-network. For a database client, open an
+    # SSH tunnel to this port on the server (it listens on the server's loopback address only).
+    ports: ["127.0.0.1:${MSSQL_HOST_PORT:-1433}:1433"]
+    volumes: [mssql-data:/var/opt/mssql]
+    networks:
+      dokploy-network:
+        aliases: [ugarms-mssql]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -Q 'SELECT 1' -b -o /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: "no"
+    depends_on:
+      mssql: { condition: service_healthy }
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in the Environment tab}
+      DB_NAME: ${DB_NAME:-ug_arms}
+      DB_USER: ${DB_USER:?Set DB_USER in the Environment tab}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the Environment tab}
+    networks: [dokploy-network]
+    entrypoint: ["/bin/bash", "-c"]
+    # $$ is a literal $ for the shell (a single $ would be filled in by Compose). Names are limited to letters, digits
+    # and underscores; quotes in the password are escaped; -x stops sqlcmd treating $( in a password as a variable.
+    command:
+      - |
+        set -euo pipefail
+        for v in DB_NAME DB_USER; do
+          [[ "$${!v}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,127}$$ ]] || { echo "$$v may contain only letters, digits and underscores" >&2; exit 1; }
+        done
+        [[ "$$DB_USER" != "sa" ]] || { echo "DB_USER must not be sa; choose a login name for the application" >&2; exit 1; }
+        pw="$${DB_PASSWORD//\'/\'\'}"
+        /opt/mssql-tools18/bin/sqlcmd -C -b -x -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -Q "
+          SET NOCOUNT ON;
+          IF DB_ID(N'$$DB_NAME') IS NULL BEGIN CREATE DATABASE [$$DB_NAME]; PRINT 'Created database $$DB_NAME'; END
+          ELSE PRINT 'Database $$DB_NAME already exists';
+          IF SUSER_ID(N'$$DB_USER') IS NULL BEGIN
+            CREATE LOGIN [$$DB_USER] WITH PASSWORD = N'$$pw', DEFAULT_DATABASE = [$$DB_NAME], CHECK_POLICY = ON;
+            PRINT 'Created login $$DB_USER';
+          END ELSE BEGIN
+            ALTER LOGIN [$$DB_USER] WITH PASSWORD = N'$$pw';
+            PRINT 'Login $$DB_USER exists; password set from DB_PASSWORD';
+          END;
+          EXEC (N'USE [$$DB_NAME];
+            IF USER_ID(N''$$DB_USER'') IS NULL CREATE USER [$$DB_USER] FOR LOGIN [$$DB_USER];
+            IF IS_ROLEMEMBER(N''db_owner'', N''$$DB_USER'') = 0 ALTER ROLE db_owner ADD MEMBER [$$DB_USER];');
+          PRINT 'Login $$DB_USER owns database $$DB_NAME';
+        "
+
+volumes:
+  mssql-data:
+
+networks:
+  dokploy-network:
+    external: true
