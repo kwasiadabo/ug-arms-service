@@ -43,7 +43,14 @@ const schema = z.object({
   APP_NAME: z.string().default('UG-ARMS'),
   PUBLIC_APP_URL: z.string().url().default('http://localhost:5190'),
   CORS_ORIGINS: z.string().default('http://localhost:5190'),
-  TRUST_PROXY: bool.default(false),
+  // How many reverse proxies sit in front of the API, so client addresses (rate limits, audit trail) are read from the
+  // right X-Forwarded-For entry. "true" means one (Nginx alone); behind a second proxy such as Traefik in front of
+  // Nginx, set 2. Too high a number lets clients forge their address.
+  TRUST_PROXY: z
+    .union([z.boolean(), z.string()])
+    .transform((v) => (v === true || v === 'true' ? 1 : v === false || v === 'false' || v === '' ? 0 : Number(v)))
+    .pipe(z.number().int().min(0).max(5))
+    .default(0),
 
   DB_HOST: z.string().default('localhost'),
   DB_PORT: z.coerce.number().default(1433),

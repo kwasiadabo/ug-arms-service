@@ -38,7 +38,7 @@ import apiRouter, { MOUNTS } from './routes/index.js';
 export function createApp() {
   const app = express();
   app.disable('x-powered-by');
-  if (env.TRUST_PROXY) app.set('trust proxy', 1);
+  if (env.TRUST_PROXY) app.set('trust proxy', env.TRUST_PROXY);
 
   app.use(requestContextMiddleware);
   app.use(
