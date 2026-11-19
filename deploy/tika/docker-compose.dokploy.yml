@@ -1,0 +1,38 @@
+# Apache Tika, which extracts text and metadata from uploaded documents (PDF, Word, spreadsheets and so on) for
+# search, on a Dokploy server (Docker Compose deployment).
+#
+# Settings come from the deployment's Environment tab (Dokploy writes them to .env beside this file; see
+# .env.example). All are optional. Tika has no login and parses untrusted files, so it must never be published to
+# the internet: only dokploy-network and the server's loopback address can reach it.
+#
+# The backend (API and worker) connects with
+#   TIKA_ENABLED=true  TIKA_URL=http://ugarms-tika:9998
+# (TIKA_ENABLED defaults to false in the backend, so it must be set.)
+
+services:
+  tika:
+    image: apache/tika:${TIKA_VERSION:-4.2.0}
+    restart: unless-stopped
+    environment:
+      # Memory for Tika's Java processes. Large or unusual documents need more.
+      JAVA_TOOL_OPTIONS: -Xmx${TIKA_HEAP:-1g}
+      TZ: ${TZ:-Africa/Accra}
+    ports: ["127.0.0.1:${TIKA_HOST_PORT:-9998}:9998"]
+    networks:
+      dokploy-network:
+        aliases: [ugarms-tika]
+    # The image has no curl or wget, so the check asks for /version through bash.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - exec 3<>/dev/tcp/127.0.0.1/9998 && printf 'GET /version HTTP/1.0\r\n\r\n' >&3 && head -1 <&3 | grep -q ' 200'
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 4
+
+networks:
+  dokploy-network:
+    external: true

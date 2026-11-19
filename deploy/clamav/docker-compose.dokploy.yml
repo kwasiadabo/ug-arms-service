@@ -1,0 +1,50 @@
+# ClamAV, the virus scanner for UG-ARMS uploads, on a Dokploy server (Docker Compose deployment). The backend sends
+# every uploaded file to it; files are published only after a clean scan.
+#
+# Settings come from the deployment's Environment tab (Dokploy writes them to .env beside this file; see
+# .env.example). All are optional. ClamAV has no login: it is protected by never being published to the internet
+# (only dokploy-network and the server's loopback address can reach it), so keep it that way.
+#
+# The backend (API and worker) connects with
+#   CLAMAV_ENABLED=true  CLAMAV_HOST=ugarms-clamav  CLAMAV_PORT=3310
+#
+# Needs about 3 GB of RAM (4 GB preferred). On its first start it downloads the virus signatures (about 300 MB) and
+# is not ready until they are loaded, which can take several minutes; the signatures are kept on a volume, so later
+# restarts are quick and do not hit the download servers' rate limits. Signatures update themselves every day.
+
+services:
+  clamav:
+    image: clamav/clamav:${CLAMAV_VERSION:-1.5}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Africa/Accra}
+      # Signature updates per day.
+      FRESHCLAM_CHECKS: ${CLAMAV_UPDATES_PER_DAY:-4}
+      # The image copies CLAMD_CONF_* variables into clamd.conf. The defaults reject files over 25-400 MB, which the
+      # backend would report as a scan error and hold for a re-scan for ever; match the backend's MAX_UPLOAD_MB
+      # instead (clamd's ceiling is 4095 MB).
+      CLAMD_CONF_StreamMaxLength: ${CLAMAV_MAX_FILE_MB:-2048}M
+      CLAMD_CONF_MaxFileSize: ${CLAMAV_MAX_FILE_MB:-2048}M
+      CLAMD_CONF_MaxScanSize: ${CLAMAV_MAX_FILE_MB:-2048}M
+      # "no" halves memory use while the daily signatures reload, at the cost of scans waiting for the reload (under a
+      # minute). Set "yes" on a server with RAM to spare.
+      CLAMD_CONF_ConcurrentDatabaseReload: ${CLAMAV_CONCURRENT_RELOAD:-no}
+    ports: ["127.0.0.1:${CLAMAV_HOST_PORT:-3310}:3310"]
+    volumes: [clamav-signatures:/var/lib/clamav]
+    networks:
+      dokploy-network:
+        aliases: [ugarms-clamav]
+    # The image's own check (clamd answers PING). The first signature download is allowed up to 10 minutes.
+    healthcheck:
+      test: ["CMD-SHELL", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10m
+      retries: 3
+
+volumes:
+  clamav-signatures:
+
+networks:
+  dokploy-network:
+    external: true
