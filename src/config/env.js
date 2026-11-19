@@ -124,7 +124,9 @@ const schema = z.object({
 
 const parsed = schema.safeParse(process.env);
 if (!parsed.success) {
-  console.error('Invalid environment configuration:', z.treeifyError(parsed.error));
+  // One line per setting, naming the variable and the rule it breaks (never its value, which may be a secret).
+  const lines = parsed.error.issues.map((i) => ` - ${i.path.join('.') || '(environment)'}: ${i.message}`);
+  console.error(`Invalid environment configuration:\n${lines.join('\n')}`);
   process.exit(1);
 }
 
