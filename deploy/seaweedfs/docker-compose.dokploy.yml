@@ -1,0 +1,53 @@
+# SeaweedFS, the S3-compatible object store for UG-ARMS digital files, on a Dokploy server (Docker Compose
+# deployment). start.sh in this folder starts it and prepares the bucket with S3 Object Lock; see its header for what
+# each credential may do. Deploy from the Git repository (not Dokploy's Raw editor), so start.sh is next to this file.
+#
+# Settings come from the deployment's Environment tab (Dokploy writes them to .env beside this file; see
+# .env.example). Deployment stops if a required variable is missing.
+#
+# The backend connects with
+#   S3_ENDPOINT=http://ugarms-seaweedfs:8333  S3_BUCKET  S3_ACCESS_KEY  S3_SECRET_KEY  S3_FORCE_PATH_STYLE=true
+# and, on the API only, S3_DISPOSAL_ACCESS_KEY and S3_DISPOSAL_SECRET_KEY.
+#
+# Object Lock cannot be switched off once the bucket exists, and files under retention cannot be deleted before
+# their retention date, even by a server administrator using S3. Back up the volume as described in the
+# backup-and-recovery guide.
+
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.51
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/seaweedfs/start.sh"]
+    environment:
+      S3_BUCKET: ${S3_BUCKET:-ug-arms-objects}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY in the Environment tab}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in the Environment tab}
+      # Optional: leave both empty and files under retention can never be destroyed, even by authorised disposal.
+      S3_DISPOSAL_ACCESS_KEY: ${S3_DISPOSAL_ACCESS_KEY:-}
+      S3_DISPOSAL_SECRET_KEY: ${S3_DISPOSAL_SECRET_KEY:-}
+      SEAWEEDFS_VOLUME_SIZE_MB: ${SEAWEEDFS_VOLUME_SIZE_MB:-1024}
+      # The address SeaweedFS's parts use to find each other; it must resolve to this container.
+      SEAWEEDFS_IP: ugarms-seaweedfs
+    # Only the S3 port, and only on the server's loopback address (for SSH tunnels). The master and filer admin ports
+    # are not published.
+    ports: ["127.0.0.1:${S3_HOST_PORT:-8333}:8333"]
+    volumes:
+      - seaweedfs-data:/data
+      - ./start.sh:/etc/seaweedfs/start.sh:ro
+    networks:
+      dokploy-network:
+        aliases: [ugarms-seaweedfs]
+    healthcheck:
+      # Healthy only once the bucket exists with Object Lock enabled.
+      test: ["CMD-SHELL", "test -f /tmp/bucket-ready && wget -qO- http://127.0.0.1:9333/cluster/status >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+
+volumes:
+  seaweedfs-data:
+
+networks:
+  dokploy-network:
+    external: true

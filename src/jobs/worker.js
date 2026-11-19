@@ -58,7 +58,16 @@ for (const w of workers) {
   w.on('failed', (job, err) => logger.warn({ queue: w.name, job: job?.name, err: err.message }, 'Job failed'));
 }
 await registerSchedules();
-logger.info(`UG-ARMS worker started for queues: ${QUEUES.join(', ')} (redis ${env.REDIS_URL})`);
+// The URL may carry the Redis password; log only where it points.
+const redisAt = (() => {
+  try {
+    const u = new URL(env.REDIS_URL);
+    return `${u.hostname}:${u.port || 6379}`;
+  } catch {
+    return 'configured address';
+  }
+})();
+logger.info(`UG-ARMS worker started for queues: ${QUEUES.join(', ')} (redis ${redisAt})`);
 
 /**
  * Stops all queue workers, letting running jobs finish, then closes the database connection and exits.

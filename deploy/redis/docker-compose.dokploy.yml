@@ -1,0 +1,44 @@
+# Redis for UG-ARMS on a Dokploy server (Docker Compose deployment). It holds the job queues (OCR, virus scans,
+# search indexing, e-mail), so it keeps its data on disk and never evicts keys.
+#
+# Settings come from the deployment's Environment tab (Dokploy writes them to .env beside this file; see
+# .env.example). Deployment stops if REDIS_PASSWORD is missing.
+#
+# The backend (API and worker) connects with
+#   REDIS_URL=redis://:<REDIS_PASSWORD>@ugarms-redis:6379
+# Use a password of letters and digits only (openssl rand -hex 32), so it needs no escaping in the URL.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in the Environment tab}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-512mb}
+    # The password is read from the environment by the shell, so it is not written into this file. $$ is a literal $
+    # for the shell. appendonly: queued jobs survive a restart. noeviction: required by BullMQ, which would lose jobs
+    # if Redis threw keys away when full.
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes --appendfsync everysec
+        --maxmemory "$$REDIS_MAXMEMORY" --maxmemory-policy noeviction
+    # Not published to the internet; use an SSH tunnel to this loopback port to inspect it.
+    ports: ["127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"]
+    volumes: [redis-data:/data]
+    networks:
+      dokploy-network:
+        aliases: [ugarms-redis]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  redis-data:
+
+networks:
+  dokploy-network:
+    external: true

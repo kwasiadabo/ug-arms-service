@@ -65,7 +65,7 @@ services:
         done
         [[ "$$DB_USER" != "sa" ]] || { echo "DB_USER must not be sa; choose a login name for the application" >&2; exit 1; }
         pw="$${DB_PASSWORD//\'/\'\'}"
-        /opt/mssql-tools18/bin/sqlcmd -C -b -x -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -Q "
+        /opt/mssql-tools18/bin/sqlcmd -C -b -x -S ugarms-mssql -U sa -P "$$MSSQL_SA_PASSWORD" -Q "
           SET NOCOUNT ON;
           IF DB_ID(N'$$DB_NAME') IS NULL BEGIN CREATE DATABASE [$$DB_NAME]; PRINT 'Created database $$DB_NAME'; END
           ELSE PRINT 'Database $$DB_NAME already exists';
