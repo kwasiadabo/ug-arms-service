@@ -12,7 +12,7 @@
 
 import { registerInlineHandler, enqueue } from '../services/queue.service.js';
 import { sendMail } from '../services/mail.service.js';
-import { processAsset } from '../modules/digital-assets/assets.service.js';
+import { processAsset, storeAsset } from '../modules/digital-assets/assets.service.js';
 import { executeOcrJob } from '../modules/digitisation/ocr.service.js';
 import { runFixityCheck, dueForFixity, replicate } from '../services/preservation.service.js';
 import { reconcileObjectLocks } from '../services/objectLock.service.js';
@@ -31,6 +31,7 @@ export const handlers = {
     await sendMail({ to, subject, body, actionUrl, actionLabel });
     return { sent: true };
   },
+  'asset.store': ({ assetId }) => storeAsset(assetId),
   'asset.process': ({ assetId }) => processAsset(assetId),
   'ocr.run': ({ ocrJobId }) => executeOcrJob(ocrJobId),
   'preservation.fixity': ({ assetId, triggeredBy }) => runFixityCheck(assetId, triggeredBy),

@@ -392,7 +392,7 @@ export async function progress(batchId) {
     qaPassed: items.filter((i) => i.status === 'qa_passed').length,
     qaFailed: items.filter((i) => ['qa_failed', 'rework'].includes(i.status)).length,
     assets: assets.length,
-    assetsProcessing: assets.filter((a) => ['processing', 'uploaded'].includes(a.status)).length,
+    assetsProcessing: assets.filter((a) => ['uploaded', 'scanning', 'processing'].includes(a.status)).length,
     ocrPending: assets.filter((a) => ['queued', 'running', 'pending'].includes(a.ocrStatus)).length,
     ocrFailed: assets.filter((a) => a.ocrStatus === 'failed').length,
     expectedPages: items.reduce((n, i) => n + (i.expectedPages || 0), 0),
@@ -439,7 +439,7 @@ export async function transitionBatch(batchId, { action, reason }, user) {
     }
     if (action === 'processing_complete') {
       const stillProcessing = await models.DigitalAsset.count({
-        where: { digitisationItemId: items.map((i) => i.id), status: ['uploaded', 'processing'] },
+        where: { digitisationItemId: items.map((i) => i.id), status: ['uploaded', 'scanning', 'processing'] },
         transaction: t,
       });
       if (stillProcessing) throw badRequest(`${stillProcessing} file(s) are still being processed`);

@@ -287,12 +287,14 @@ assetsRouter.post(
   validate({ params: idParams }),
   async (req, res) => {
     const a = await models.DigitalAsset.findByPk(req.params.id);
-    if (!a || !['failed', 'processing'].includes(a.status))
+    if (!a || !['failed', 'processing', 'uploaded', 'scanning'].includes(a.status))
       throw badRequest('Only failed or stuck assets can be reprocessed');
-    await a.update({ status: 'processing', ingestError: null });
+    // A file that never reached storage is scanned and stored again from staging; any other is processed again.
+    const stored = Boolean(a.storageKey);
+    if (stored) await a.update({ status: 'processing', ingestError: null });
     const jobId = await enqueue(
       'ingest',
-      'asset.process',
+      stored ? 'asset.process' : 'asset.store',
       { assetId: a.id },
       { entityType: 'DigitalAsset', entityId: a.id, requestedById: req.user.id },
     );

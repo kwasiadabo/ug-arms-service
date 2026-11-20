@@ -97,6 +97,9 @@ services:
       # the API's own domain through Traefik alone. Too high lets clients forge their address.
       TRUST_PROXY: ${TRUST_PROXY:?Set TRUST_PROXY (2 behind the web application, 1 on the API's own domain)}
       SWAGGER_ENABLED: ${SWAGGER_ENABLED:-false}
+    # Shared by every API copy and the worker: uploads wait in uploads/staging until the worker has scanned and
+    # stored them. All copies run on this one server, so a named volume is enough.
+    volumes: [uploads:/app/uploads]
     # The image's health check calls /api/v1/health/ready; Traefik sends requests only to healthy copies.
     networks:
       dokploy-network:
@@ -108,9 +111,13 @@ services:
     environment:
       <<: *common-env
       OCR_CONCURRENCY: ${OCR_CONCURRENCY:-2}
+    volumes: [uploads:/app/uploads]
     depends_on:
       db-init: { condition: service_completed_successfully }
     networks: [dokploy-network]
+
+volumes:
+  uploads:
 
 networks:
   dokploy-network:

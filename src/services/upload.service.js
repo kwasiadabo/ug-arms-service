@@ -6,6 +6,12 @@
  * scanned for malware, given a SHA-256 checksum and streamed to private object storage. The temporary file is
  * always deleted, whatever the outcome. Uploaded files are never executed.
  *
+ * Digital asset uploads are split in two so that large batches do not hold the request open: `stageTempFile` does
+ * the quick checks (type, format, checksum) and moves the file to a staging folder named after its asset, and
+ * `storeStagedFile`, run by a background job, scans it and copies it to object storage. The staging folder sits
+ * next to the temporary folder (the same volume in Docker, so moving a file is a rename), and the API and worker
+ * must share it.
+ *
  * @author Kwasi Adabo Boakye
  */
 
@@ -22,7 +28,17 @@ import { scanFile } from '../integrations/clamav.js';
 import { storage, buildKey } from './storage/index.js';
 
 const TMP = path.resolve('uploads/tmp');
+const STAGING = path.resolve('uploads/staging');
 fs.mkdirSync(TMP, { recursive: true });
+fs.mkdirSync(STAGING, { recursive: true });
+
+/**
+ * Returns where the staged upload of an asset is kept until it has been scanned and stored.
+ *
+ * @param {string} assetId Identifier of the asset (a UUID, so it is safe as a file name).
+ * @returns {string} The file path.
+ */
+export const stagingPath = (assetId) => path.join(STAGING, `${assetId}.upload`);
 
 /**
  * Creates Multer middleware that saves uploaded files to the private temporary folder under random names.
@@ -163,6 +179,70 @@ export async function ingestTempFile(file, { area, allowed } = {}) {
   } finally {
     await fsp.rm(file.path, { force: true });
   }
+}
+
+/**
+ * Does the quick checks on one uploaded file, the first half of a staged upload: identifies its type by content,
+ * checks it against the format registry and calculates its SHA-256 checksum. The file stays where it is; a file that
+ * fails is deleted.
+ *
+ * @param {{ path: string, originalname: string, size: number }} file The temporary file from Multer.
+ * @param {{ allowed?: string[] }} [options] The media types allowed here.
+ * @returns {Promise<{ sha256: string, mediaType: string, ext: string, size: number, format: object }>}
+ * @throws {AppError} 400 when the file type is not accepted.
+ */
+export async function checkTempFile(file, { allowed } = {}) {
+  try {
+    const { mediaType, ext } = await detectType(file.path, file.originalname);
+    const format = await assertAcceptedFormat(mediaType, file.originalname, allowed);
+    const sha256 = await sha256File(file.path);
+    return { sha256, mediaType, ext, size: file.size, format };
+  } catch (err) {
+    await fsp.rm(file.path, { force: true });
+    throw err;
+  }
+}
+
+/**
+ * Moves a checked temporary file to the staging folder under its asset's identifier, where the background job finds
+ * it.
+ *
+ * @param {{ path: string }} file The temporary file from Multer.
+ * @param {string} assetId Identifier of the asset it will become.
+ * @returns {Promise<string>} The staging path.
+ */
+export async function moveToStaging(file, assetId) {
+  const target = stagingPath(assetId);
+  try {
+    await fsp.rename(file.path, target);
+  } catch (err) {
+    // Different file systems (for example a staging volume mounted apart from the temporary folder): copy instead.
+    if (err.code !== 'EXDEV') throw err;
+    await fsp.copyFile(file.path, target);
+    await fsp.rm(file.path, { force: true });
+  }
+  return target;
+}
+
+/**
+ * Scans a staged upload and, unless it is infected, copies it to object storage: the second half of a staged upload,
+ * run by a background job. The staged file is left in place for the caller to delete once the result is recorded.
+ *
+ * If the scanner was unavailable, the file is stored but marked with malware status "error", which keeps it from
+ * being processed or published until it has been re-scanned.
+ *
+ * @param {string} assetId Identifier of the asset.
+ * @param {{ area: string, originalName: string, mediaType: string, sha256: string }} details Storage area, the file's
+ *   original name (for the key), its media type and its checksum (stored as object metadata).
+ * @returns {Promise<{ malwareStatus: string, scan: object, storageKey?: string }>} No storage key when infected.
+ */
+export async function storeStagedFile(assetId, { area, originalName, mediaType, sha256 }) {
+  const file = stagingPath(assetId);
+  const scan = await scanFile(file);
+  if (scan.status === 'infected') return { malwareStatus: 'infected', scan };
+  const storageKey = buildKey(area, originalName);
+  await storage.put(storageKey, fs.createReadStream(file), { contentType: mediaType, metadata: { sha256 } });
+  return { storageKey, malwareStatus: scan.status === 'error' ? 'error' : scan.status, scan };
 }
 
 /**

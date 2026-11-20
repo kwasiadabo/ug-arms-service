@@ -2,8 +2,9 @@
  * Digital asset lifecycle: upload, background ingest, derivatives, OCR queueing, metadata updates, publication,
  * deletion and secure delivery.
  *
- * Each upload is checked by content signature, scanned for malware, given a SHA-256 checksum and stored privately
- * before its database row exists, and every step is recorded as a preservation event. Preservation masters are
+ * Each upload is checked by content signature and given a SHA-256 checksum while the request is open; the malware
+ * scan and the copy to private storage run afterwards as a background job, so a large batch does not hold the
+ * request open. Every step is recorded as a preservation event. Preservation masters are
  * never published or deleted outside an approved disposal; only access copies can be published, and only after a
  * clean malware scan, passed quality assurance and publication of the description.
  *
@@ -26,7 +27,14 @@ import { models, sequelize } from '../../database/models/index.js';
 import { badRequest, notFound, forbidden } from '../../utils/errors.js';
 import { audit, diff } from '../../services/audit.service.js';
 import { storage, buildKey } from '../../services/storage/index.js';
-import { ingestTempFile, cleanupFiles } from '../../services/upload.service.js';
+import crypto from 'node:crypto';
+import {
+  checkTempFile,
+  moveToStaging,
+  stagingPath,
+  storeStagedFile,
+  cleanupFiles,
+} from '../../services/upload.service.js';
 import { enqueue } from '../../services/queue.service.js';
 import { recordEvent } from '../../services/preservation.service.js';
 import { protectAsset } from '../../services/objectLock.service.js';
@@ -57,13 +65,13 @@ export const presentAsset = (a) => {
  * Uploads one or more files as new digital assets.
  *
  * For each file:
- * - It is validated, scanned, hashed and stored; files that fail are reported in `rejected` while the others
- *   continue.
+ * - Its type is identified by content, checked against the format registry and its checksum calculated; files that
+ *   fail are reported in `rejected` while the others continue.
  * - Identical content already attached to the same description is rejected unless duplicates are allowed. Identical
  *   content elsewhere is accepted but linked as a possible duplicate.
- * - The asset row, its checksum and its ingest, validation, malware-scan and checksum events are created in one
- *   transaction. A file whose scan could not complete is quarantined; otherwise processing is queued after the
- *   commit.
+ * - The file is moved to staging and the asset row (status "uploaded"), its checksum and its ingest, validation and
+ *   checksum events are created in one transaction. The malware scan and the copy to storage are queued after the
+ *   commit (`storeAsset`), so the request returns without waiting for them.
  * - A migrated version is linked to its source with a format-migration event on both. A migration never replaces
  *   the master.
  *
@@ -106,7 +114,7 @@ export async function uploadAssets(files, opts, user) {
     for (const [i, file] of files.entries()) {
       let r;
       try {
-        r = await ingestTempFile(file, { area: 'assets' });
+        r = await checkTempFile(file);
       } catch (err) {
         rejected.push({ filename: file.originalname, error: err.message });
         await audit({
@@ -123,7 +131,6 @@ export async function uploadAssets(files, opts, user) {
         attributes: ['id', 'recordId', 'role'],
       });
       if (duplicate && duplicate.recordId === recordId && !allowDuplicate) {
-        await storage.remove(r.storageKey).catch(() => {});
         rejected.push({
           filename: file.originalname,
           error: 'Identical content is already attached to this description',
@@ -131,130 +138,125 @@ export async function uploadAssets(files, opts, user) {
         });
         continue;
       }
-      const asset = await sequelize.transaction(async (t) => {
-        const a = await models.DigitalAsset.create(
-          {
-            recordId,
-            physicalItemId,
-            digitisationItemId,
-            parentAssetId,
-            role,
-            title: files.length === 1 ? title : null,
-            originalFilename: file.originalname.slice(0, 500),
-            declaredMediaType: file.mimetype,
-            mediaType: r.mediaType,
-            extension: r.ext,
-            sizeBytes: r.size,
-            sha256: r.sha256,
-            storageKey: r.storageKey,
-            storageDriver: storage.name,
-            status: r.malwareStatus === 'error' ? 'quarantined' : 'processing',
-            malwareStatus: r.malwareStatus,
-            formatRisk: r.format.riskLevel,
-            duplicateOfId: duplicate?.id ?? null,
-            uploadedById: user.id,
-            idempotencyKey: idempotencyKey ? (files.length > 1 ? `${idempotencyKey}:${i}` : idempotencyKey) : null,
-            qaStatus: digitisationItemId ? 'pending' : 'not_required',
-            ocrStatus: r.format.ocrEligible ? 'pending' : 'not_applicable',
-          },
-          { transaction: t },
-        );
-        await models.AssetChecksum.create(
-          { assetId: a.id, algorithm: 'SHA-256', value: r.sha256, source: 'ingest' },
-          { transaction: t },
-        );
-        await recordEvent(
-          {
-            assetId: a.id,
-            recordId,
-            eventType: 'ingest',
-            detail: `Ingested ${file.originalname}`,
-            technicalDetail: { size: r.size, mediaType: r.mediaType, declaredMediaType: file.mimetype },
-          },
-          { transaction: t },
-        );
-        await recordEvent(
-          {
-            assetId: a.id,
-            recordId,
-            eventType: 'validation',
-            detail: `File signature identified as ${r.mediaType}`,
-            technicalDetail: { extension: r.ext },
-          },
-          { transaction: t },
-        );
-        await recordEvent(
-          {
-            assetId: a.id,
-            recordId,
-            eventType: 'malware_scan',
-            outcome: r.malwareStatus === 'clean' ? 'success' : r.malwareStatus === 'skipped' ? 'warning' : 'failure',
-            detail:
-              r.malwareStatus === 'skipped' ? 'Malware scanning is not enabled' : `Scan result: ${r.malwareStatus}`,
-            technicalDetail: r.scan,
-          },
-          { transaction: t },
-        );
-        await recordEvent(
-          {
-            assetId: a.id,
-            recordId,
-            eventType: 'checksum_calculation',
-            detail: 'SHA-256 calculated at ingest',
-            technicalDetail: { sha256: r.sha256 },
-          },
-          { transaction: t },
-        );
-        if (role === 'migrated_version' && parentAssetId) {
-          // A migration never replaces the master: the new object is linked to its source with provenance.
-          const source = await models.DigitalAsset.findByPk(parentAssetId, { transaction: t });
-          if (!source) throw notFound('Source asset for migration');
-          await a.update({ versionNumber: (source.versionNumber || 1) + 1 }, { transaction: t });
+      const id = crypto.randomUUID();
+      await moveToStaging(file, id);
+      const asset = await sequelize
+        .transaction(async (t) => {
+          const a = await models.DigitalAsset.create(
+            {
+              id,
+              recordId,
+              physicalItemId,
+              digitisationItemId,
+              parentAssetId,
+              role,
+              title: files.length === 1 ? title : null,
+              originalFilename: file.originalname.slice(0, 500),
+              declaredMediaType: file.mimetype,
+              mediaType: r.mediaType,
+              extension: r.ext,
+              sizeBytes: r.size,
+              sha256: r.sha256,
+              storageDriver: storage.name,
+              status: 'uploaded',
+              malwareStatus: 'pending',
+              formatRisk: r.format.riskLevel,
+              duplicateOfId: duplicate?.id ?? null,
+              uploadedById: user.id,
+              idempotencyKey: idempotencyKey ? (files.length > 1 ? `${idempotencyKey}:${i}` : idempotencyKey) : null,
+              qaStatus: digitisationItemId ? 'pending' : 'not_required',
+              ocrStatus: r.format.ocrEligible ? 'pending' : 'not_applicable',
+            },
+            { transaction: t },
+          );
+          await models.AssetChecksum.create(
+            { assetId: a.id, algorithm: 'SHA-256', value: r.sha256, source: 'ingest' },
+            { transaction: t },
+          );
           await recordEvent(
             {
               assetId: a.id,
               recordId,
-              eventType: 'format_migration',
-              detail: `Migrated version of ${source.originalFilename}`,
-              technicalDetail: {
-                sourceAssetId: source.id,
-                sourceMediaType: source.mediaType,
-                sourceSha256: source.sha256,
-                targetMediaType: r.mediaType,
-                targetSha256: r.sha256,
-              },
+              eventType: 'ingest',
+              detail: `Ingested ${file.originalname}`,
+              technicalDetail: { size: r.size, mediaType: r.mediaType, declaredMediaType: file.mimetype },
             },
             { transaction: t },
           );
           await recordEvent(
             {
-              assetId: source.id,
-              recordId: source.recordId,
-              eventType: 'format_migration',
-              detail: `New migrated version created: ${a.originalFilename}`,
-              technicalDetail: { derivedAssetId: a.id },
+              assetId: a.id,
+              recordId,
+              eventType: 'validation',
+              detail: `File signature identified as ${r.mediaType}`,
+              technicalDetail: { extension: r.ext },
             },
             { transaction: t },
           );
-        }
-        await audit(
-          {
-            action: 'asset.upload',
-            resourceType: 'DigitalAsset',
-            resourceId: a.id,
-            after: { recordId, filename: a.originalFilename, sha256: r.sha256, mediaType: r.mediaType, role },
-          },
-          { transaction: t },
-        );
-        if (a.status === 'processing')
+          await recordEvent(
+            {
+              assetId: a.id,
+              recordId,
+              eventType: 'checksum_calculation',
+              detail: 'SHA-256 calculated at ingest',
+              technicalDetail: { sha256: r.sha256 },
+            },
+            { transaction: t },
+          );
+          if (role === 'migrated_version' && parentAssetId) {
+            // A migration never replaces the master: the new object is linked to its source with provenance.
+            const source = await models.DigitalAsset.findByPk(parentAssetId, { transaction: t });
+            if (!source) throw notFound('Source asset for migration');
+            await a.update({ versionNumber: (source.versionNumber || 1) + 1 }, { transaction: t });
+            await recordEvent(
+              {
+                assetId: a.id,
+                recordId,
+                eventType: 'format_migration',
+                detail: `Migrated version of ${source.originalFilename}`,
+                technicalDetail: {
+                  sourceAssetId: source.id,
+                  sourceMediaType: source.mediaType,
+                  sourceSha256: source.sha256,
+                  targetMediaType: r.mediaType,
+                  targetSha256: r.sha256,
+                },
+              },
+              { transaction: t },
+            );
+            await recordEvent(
+              {
+                assetId: source.id,
+                recordId: source.recordId,
+                eventType: 'format_migration',
+                detail: `New migrated version created: ${a.originalFilename}`,
+                technicalDetail: { derivedAssetId: a.id },
+              },
+              { transaction: t },
+            );
+          }
+          await audit(
+            {
+              action: 'asset.upload',
+              resourceType: 'DigitalAsset',
+              resourceId: a.id,
+              after: { recordId, filename: a.originalFilename, sha256: r.sha256, mediaType: r.mediaType, role },
+            },
+            { transaction: t },
+          );
+          // Malware scan and copy to storage, after the commit so the job always finds the row.
           await enqueue(
             'ingest',
-            'asset.process',
+            'asset.store',
             { assetId: a.id },
             { entityType: 'DigitalAsset', entityId: a.id, requestedById: user.id, transaction: t },
           );
-        return a;
-      });
+          return a;
+        })
+        .catch(async (err) => {
+          await fsp.rm(stagingPath(id), { force: true });
+          throw err;
+        });
       created.push(presentAsset(asset));
     }
   } finally {
@@ -367,6 +369,99 @@ export async function processAsset(assetId) {
 }
 
 /**
+ * Background job for a new upload: scans the staged file for malware and copies it to private storage, then queues
+ * processing. Safe to run more than once and concurrently: only one run handles the asset at a time.
+ *
+ * - An infected file is rejected and never stored.
+ * - A file whose scan could not complete is stored but quarantined until it has been re-scanned.
+ * - Otherwise the asset moves on to processing (`processAsset`).
+ *
+ * Any other error (storage unreachable, for example) marks the asset as failed and is rethrown, so the job is retried
+ * from the staged file; reprocessing a failed upload queues this job again.
+ *
+ * @param {string} assetId Identifier of the asset.
+ * @returns {Promise<object>} `{ status }` with the asset's new status, or `{ skipped: true }` when the asset is not
+ *   waiting to be stored.
+ */
+export async function storeAsset(assetId) {
+  return withAssetLock(assetId, () => storeStagedAsset(assetId));
+}
+
+/**
+ * Performs the work of `storeAsset` once its lock is held.
+ *
+ * @param {string} assetId Identifier of the asset.
+ * @returns {Promise<object>} The outcome.
+ */
+async function storeStagedAsset(assetId) {
+  const asset = await models.DigitalAsset.findByPk(assetId);
+  if (!asset || asset.storageKey || !['uploaded', 'scanning', 'failed'].includes(asset.status))
+    return { skipped: true };
+  const staged = stagingPath(asset.id);
+  if (!fs.existsSync(staged)) {
+    await asset.update({ status: 'failed', ingestError: 'The uploaded file is no longer available; upload it again' });
+    return { status: 'failed' };
+  }
+  await asset.update({ status: 'scanning', ingestError: null });
+  let r;
+  try {
+    r = await storeStagedFile(asset.id, {
+      area: 'assets',
+      originalName: asset.originalFilename,
+      mediaType: asset.mediaType,
+      sha256: asset.sha256,
+    });
+  } catch (err) {
+    await asset.update({ status: 'failed', ingestError: `Could not store the file: ${err.message}`.slice(0, 2000) });
+    throw err;
+  }
+  const scanEvent = {
+    assetId: asset.id,
+    recordId: asset.recordId,
+    eventType: 'malware_scan',
+    outcome: r.malwareStatus === 'clean' ? 'success' : r.malwareStatus === 'skipped' ? 'warning' : 'failure',
+    detail: r.malwareStatus === 'skipped' ? 'Malware scanning is not enabled' : `Scan result: ${r.malwareStatus}`,
+    technicalDetail: r.scan,
+  };
+  const status =
+    r.malwareStatus === 'infected' ? 'rejected' : r.malwareStatus === 'error' ? 'quarantined' : 'processing';
+  await sequelize.transaction(async (t) => {
+    await asset.update(
+      {
+        status,
+        malwareStatus: r.malwareStatus,
+        storageKey: r.storageKey ?? null,
+        storageDriver: storage.name,
+        ingestError: status === 'rejected' ? 'The file failed the malware scan and was not stored' : null,
+      },
+      { transaction: t },
+    );
+    await recordEvent(scanEvent, { transaction: t });
+    if (status === 'rejected')
+      await audit(
+        {
+          action: 'asset.upload_rejected',
+          outcome: 'failure',
+          actorType: 'system',
+          resourceType: 'DigitalAsset',
+          resourceId: asset.id,
+          metadata: { filename: asset.originalFilename, error: 'Failed the malware scan', scan: r.scan },
+        },
+        { transaction: t },
+      );
+    if (status === 'processing')
+      await enqueue(
+        'ingest',
+        'asset.process',
+        { assetId: asset.id },
+        { entityType: 'DigitalAsset', entityId: asset.id, requestedById: asset.uploadedById, transaction: t },
+      );
+  });
+  await fsp.rm(staged, { force: true });
+  return { status };
+}
+
+/**
  * Performs the ingest processing of one asset that is waiting to be processed, or whose earlier attempt failed.
  *
  * - Technical metadata is extracted according to the type (image, PDF or audio/video), plus Tika metadata when
@@ -387,7 +482,8 @@ export async function processAsset(assetId) {
  */
 async function ingestAsset(assetId) {
   const asset = await models.DigitalAsset.findByPk(assetId);
-  if (!asset || !['processing', 'failed'].includes(asset.status)) return { skipped: true };
+  // Without a storage key the file never reached storage; that is storeAsset's job, not this one.
+  if (!asset || !asset.storageKey || !['processing', 'failed'].includes(asset.status)) return { skipped: true };
   // A retry of a failed attempt counts as processing again, so a batch cannot move on while it runs.
   if (asset.status === 'failed') await asset.update({ status: 'processing', ingestError: null });
   let tmp;
@@ -675,6 +771,8 @@ export async function issueDeliveryToken(assetId, user, { disposition = 'inline'
   const decision = await evaluateAsset(user, asset, asset.record);
   if (!decision.canView) throw notFound('Digital asset');
   if (disposition === 'attachment' && !decision.canDownload) throw forbidden('Downloading this file is not permitted');
+  // A new upload reaches storage only after its malware scan; until then there is nothing to deliver.
+  if (!asset.storageKey) throw badRequest('This file is still being received; try again shortly');
   const token = jwt.sign({ aid: asset.id, uid: user?.id ?? null, disp: disposition }, env.JWT_ACCESS_SECRET, {
     algorithm: 'HS256',
     audience: FILE_AUD,
@@ -718,6 +816,7 @@ export async function streamByToken(token, req, res) {
   // Re-check at fetch time so withdrawal or restriction changes take effect immediately.
   const decision = await evaluateAsset(user, asset, asset.record);
   if (!decision.canView || (claims.disp === 'attachment' && !decision.canDownload)) throw notFound('File');
+  if (!asset.storageKey) throw notFound('File');
   const range = req.get('range');
   const obj = await storage.get(asset.storageKey, range ? { range } : {});
   // Downloads are always audited; views are audited for anything that is not open access.

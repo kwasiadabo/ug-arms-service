@@ -35,7 +35,7 @@ import {
   transitionAccession,
   linkRecords,
 } from '../../modules/accessioning/accessions.service.js';
-import { uploadAssets, processAsset, setPublished } from '../../modules/digital-assets/assets.service.js';
+import { uploadAssets, storeAsset, processAsset, setPublished } from '../../modules/digital-assets/assets.service.js';
 import { runFixityCheck } from '../../services/preservation.service.js';
 import {
   createProject,
@@ -108,7 +108,7 @@ async function demoPdf(lines) {
 }
 
 /**
- * Runs the ingest pipeline for an asset and waits until it has finished.
+ * Runs the storage and ingest steps for an asset and waits until they have finished.
  *
  * If a background worker is already processing the same asset, the call waits for that run instead of processing it
  * twice, checking once per second for up to two minutes.
@@ -118,10 +118,11 @@ async function demoPdf(lines) {
  * @throws {Error} When the asset is still processing after two minutes.
  */
 async function ensureProcessed(assetId) {
+  await storeAsset(assetId);
   await processAsset(assetId);
   for (let i = 0; i < 120; i++) {
     const a = await models.DigitalAsset.findByPk(assetId, { attributes: ['status'] });
-    if (a.status !== 'processing') return;
+    if (!['uploaded', 'scanning', 'processing'].includes(a.status)) return;
     await new Promise((r) => setTimeout(r, 1000));
   }
   throw new Error(`Asset ${assetId} is still processing after 2 minutes`);

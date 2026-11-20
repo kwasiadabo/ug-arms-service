@@ -38,7 +38,7 @@ RUN npm ci --omit=dev && npm cache clean --force \
  && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 COPY src ./src
 COPY scripts ./scripts
-RUN mkdir -p uploads/tmp logs && chown -R node:node /app
+RUN mkdir -p uploads/tmp uploads/staging logs && chown -R node:node /app
 USER node
 EXPOSE 4200
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD node -e "fetch('http://127.0.0.1:4200/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
