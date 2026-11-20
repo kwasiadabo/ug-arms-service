@@ -121,7 +121,11 @@ const schema = z.object({
 
   SEED_ADMIN_EMAIL: z.string().email().default('admin@ugarms.local'),
   // Required only when the seeder creates the initial administrator. Never defaulted.
-  SEED_ADMIN_PASSWORD: z.string().min(12, 'SEED_ADMIN_PASSWORD must be at least 12 characters').optional(),
+  // An empty value counts as unset, because Docker Compose passes an unset ${SEED_ADMIN_PASSWORD:-} as "".
+  SEED_ADMIN_PASSWORD: z.preprocess(
+    (v) => (v === '' ? undefined : v),
+    z.string().min(12, 'SEED_ADMIN_PASSWORD must be at least 12 characters').optional(),
+  ),
   SEED_DEMO_DATA: bool.default(true),
   LOG_LEVEL: z.string().default('info'),
   // "json" or "pretty"; unset, logs are pretty in development and JSON in production. Containers set json because

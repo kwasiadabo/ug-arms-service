@@ -1,0 +1,104 @@
+# The UG-ARMS API and worker on a Dokploy server (Docker Compose deployment), built from this repository.
+#
+# Deploy the five backing services first (deploy/mssql, redis, seaweedfs, clamav and, optionally, tika); this file
+# reaches them over dokploy-network by their aliases (ugarms-mssql, ugarms-redis, ugarms-seaweedfs, ugarms-clamav,
+# ugarms-tika).
+#
+# Every setting comes from the deployment's Environment tab: Dokploy writes those variables to a .env file next to
+# this compose file, and Compose fills in the ${...} values below from it. See .env.example in this folder. Only the
+# variables named below reach the containers, so a stray line in the Environment tab cannot change anything else.
+# Deployment stops with a clear message if a required variable is missing.
+#
+# Two services:
+#   api     runs the database migrations and seeders, then serves the API on port 4200. Reachable on
+#           dokploy-network as  ugarms-api:4200  (the web application's API_UPSTREAM). To give the API a domain of
+#           its own, add it in the Domains tab with service "api" and container port 4200.
+#   worker  background jobs: virus scans, OCR, previews, search indexing and e-mail. Starts once the API is healthy,
+#           so the tables exist. It never receives the disposal storage credential.
+#
+# Deploy from the Git repository (not Dokploy's Raw editor): the images are built from the repository root (../..).
+# Keep Isolated Deployments off, so both services can reach the backing services on dokploy-network.
+
+x-common-env: &common-env
+  NODE_ENV: production
+  LOG_FORMAT: json
+
+  DB_HOST: ugarms-mssql
+  DB_PORT: 1433
+  DB_NAME: ${DB_NAME:-db_ug_arms}
+  DB_USER: ${DB_USER:?Set DB_USER in the Environment tab}
+  DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the Environment tab}
+
+  REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in the Environment tab}@ugarms-redis:6379
+
+  STORAGE_DRIVER: s3
+  S3_ENDPOINT: http://ugarms-seaweedfs:8333
+  S3_BUCKET: ${S3_BUCKET:-ug-arms-objects}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY in the Environment tab}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in the Environment tab}
+  S3_FORCE_PATH_STYLE: "true"
+
+  CLAMAV_ENABLED: "true"
+  CLAMAV_HOST: ugarms-clamav
+  CLAMAV_PORT: 3310
+  TIKA_ENABLED: ${TIKA_ENABLED:-false}
+  TIKA_URL: http://ugarms-tika:9998
+
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Set JWT_ACCESS_SECRET in the Environment tab}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?Set JWT_REFRESH_SECRET in the Environment tab}
+  COOKIE_SECURE: "true"
+  SEED_DEMO_DATA: "false"
+
+  PUBLIC_APP_URL: ${PUBLIC_APP_URL:?Set PUBLIC_APP_URL (the address people open) in the Environment tab}
+  CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in the Environment tab}
+
+  SMTP_HOST: ${SMTP_HOST:-localhost}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_SECURE: ${SMTP_SECURE:-false}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  MAIL_FROM: ${MAIL_FROM:-UG Archives <no-reply@localhost>}
+
+services:
+  api:
+    build: { context: ../.., dockerfile: Dockerfile }
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      # Only the API may delete files under retention (authorised disposal). Optional: leave both unset and locked
+      # files can never be destroyed.
+      S3_DISPOSAL_ACCESS_KEY: ${S3_DISPOSAL_ACCESS_KEY:-}
+      S3_DISPOSAL_SECRET_KEY: ${S3_DISPOSAL_SECRET_KEY:-}
+      # Reverse proxies in front of the API: 2 behind Traefik and the web application's Nginx, 1 when browsers reach
+      # the API's own domain through Traefik alone. Too high lets clients forge their address.
+      TRUST_PROXY: ${TRUST_PROXY:?Set TRUST_PROXY (2 behind the web application, 1 on the API's own domain)}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@ugarms.local}
+      # First start only; remove it after the first sign-in. Unset, the seeder prints a random password once.
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-false}
+    # Prepares the database on every start (creates it if missing, applies new migrations, runs new seeders; each
+    # runs once, so restarts are safe), then serves the API.
+    command:
+      - sh
+      - -c
+      - node src/database/cli.js create && node src/database/cli.js up && node src/database/cli.js seed && exec node src/server.js
+    # The image's health check calls /api/v1/health/ready. Migrations can take a while on the first start.
+    healthcheck:
+      start_period: 120s
+    networks:
+      dokploy-network:
+        aliases: [ugarms-api]
+
+  worker:
+    build: { context: ../.., dockerfile: Dockerfile.worker }
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      OCR_CONCURRENCY: ${OCR_CONCURRENCY:-2}
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [dokploy-network]
+
+networks:
+  dokploy-network:
+    external: true
