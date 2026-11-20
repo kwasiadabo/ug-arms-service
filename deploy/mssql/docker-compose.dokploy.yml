@@ -50,7 +50,7 @@ services:
       mssql: { condition: service_healthy }
     environment:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in the Environment tab}
-      DB_NAME: ${DB_NAME:-ug_arms}
+      DB_NAME: ${DB_NAME:-db_ug_arms}
       DB_USER: ${DB_USER:?Set DB_USER in the Environment tab}
       DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the Environment tab}
     networks: [dokploy-network]
