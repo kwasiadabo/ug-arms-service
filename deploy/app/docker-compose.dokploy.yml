@@ -9,12 +9,16 @@
 # variables named below reach the containers, so a stray line in the Environment tab cannot change anything else.
 # Deployment stops with a clear message if a required variable is missing.
 #
-# Two services:
-#   api     runs the database migrations and seeders, then serves the API on port 4200. Reachable on
-#           dokploy-network as  ugarms-api:4200  (the web application's API_UPSTREAM). To give the API a domain of
-#           its own, add it in the Domains tab with service "api" and container port 4200.
-#   worker  background jobs: virus scans, OCR, previews, search indexing and e-mail. Starts once the API is healthy,
-#           so the tables exist. It never receives the disposal storage credential.
+# Three services:
+#   db-init  runs once on every deployment, then exits: creates the database if it is missing, applies new
+#            migrations and runs new seeders (each runs only once, so redeploying is safe). The API and worker start
+#            only after it has finished successfully, so several API copies never migrate at the same time.
+#   api      serves the API on port 4200, API_REPLICAS copies (default 2). Traefik spreads requests across the
+#            healthy copies, and rate limits are counted in Redis, so they hold across copies. Reachable on
+#            dokploy-network as  ugarms-api:4200  (the web application's API_UPSTREAM). To give the API a domain of
+#            its own, add it in the Domains tab with service "api" and container port 4200.
+#   worker   background jobs: virus scans, OCR, previews, search indexing and e-mail. It never receives the
+#            disposal storage credential.
 #
 # Deploy from the Git repository (not Dokploy's Raw editor): the images are built from the repository root (../..).
 # Keep Isolated Deployments off, so both services can reach the backing services on dokploy-network.
@@ -60,9 +64,29 @@ x-common-env: &common-env
   MAIL_FROM: ${MAIL_FROM:-UG Archives <no-reply@localhost>}
 
 services:
+  db-init:
+    build: { context: ../.., dockerfile: Dockerfile }
+    restart: "no"
+    environment:
+      <<: *common-env
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@ugarms.local}
+      # First start only; remove it after the first sign-in. Unset, the seeder prints a random password once (in
+      # this service's log).
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+    command:
+      - sh
+      - -c
+      - node src/database/cli.js create && node src/database/cli.js up && node src/database/cli.js seed
+    healthcheck: { disable: true }
+    networks: [dokploy-network]
+
   api:
     build: { context: ../.., dockerfile: Dockerfile }
     restart: unless-stopped
+    deploy:
+      replicas: ${API_REPLICAS:-2}
+    depends_on:
+      db-init: { condition: service_completed_successfully }
     environment:
       <<: *common-env
       # Only the API may delete files under retention (authorised disposal). Optional: leave both unset and locked
@@ -72,19 +96,8 @@ services:
       # Reverse proxies in front of the API: 2 behind Traefik and the web application's Nginx, 1 when browsers reach
       # the API's own domain through Traefik alone. Too high lets clients forge their address.
       TRUST_PROXY: ${TRUST_PROXY:?Set TRUST_PROXY (2 behind the web application, 1 on the API's own domain)}
-      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@ugarms.local}
-      # First start only; remove it after the first sign-in. Unset, the seeder prints a random password once.
-      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
       SWAGGER_ENABLED: ${SWAGGER_ENABLED:-false}
-    # Prepares the database on every start (creates it if missing, applies new migrations, runs new seeders; each
-    # runs once, so restarts are safe), then serves the API.
-    command:
-      - sh
-      - -c
-      - node src/database/cli.js create && node src/database/cli.js up && node src/database/cli.js seed && exec node src/server.js
-    # The image's health check calls /api/v1/health/ready. Migrations can take a while on the first start.
-    healthcheck:
-      start_period: 120s
+    # The image's health check calls /api/v1/health/ready; Traefik sends requests only to healthy copies.
     networks:
       dokploy-network:
         aliases: [ugarms-api]
@@ -96,7 +109,7 @@ services:
       <<: *common-env
       OCR_CONCURRENCY: ${OCR_CONCURRENCY:-2}
     depends_on:
-      api: { condition: service_healthy }
+      db-init: { condition: service_completed_successfully }
     networks: [dokploy-network]
 
 networks:

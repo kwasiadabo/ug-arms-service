@@ -12,10 +12,17 @@ import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { validate } from '../../middleware/validate.js';
 import { optionalAuth } from '../../middleware/auth.js';
+import { sharedStore } from '../../middleware/rateLimit.js';
 import { captureException } from '../../services/errorTracking.service.js';
 
 const router = Router();
-const limiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false });
+const limiter = rateLimit({
+  windowMs: 60_000,
+  limit: 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  ...sharedStore('client-errors'),
+});
 
 /**
  * @openapi

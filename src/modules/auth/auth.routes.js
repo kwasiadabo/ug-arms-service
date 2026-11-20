@@ -22,6 +22,7 @@ import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { validate } from '../../middleware/validate.js';
+import { sharedStore } from '../../middleware/rateLimit.js';
 import { authenticate, ACCESS_COOKIE, REFRESH_COOKIE, CSRF_COOKIE } from '../../middleware/auth.js';
 import { email, password, idParams } from '../../validators/common.js';
 import { randomToken } from '../../utils/crypto.js';
@@ -39,6 +40,7 @@ const strictLimiter = rateLimit({
   limit: authLimit,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
+  ...sharedStore('auth'),
 });
 // Sign-in counts failed attempts only, so many staff behind one campus NAT can still sign in;
 // per-account lockout additionally protects individual accounts.
@@ -48,6 +50,7 @@ const loginLimiter = rateLimit({
   skipSuccessfulRequests: true,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
+  ...sharedStore('login'),
 });
 
 /**
